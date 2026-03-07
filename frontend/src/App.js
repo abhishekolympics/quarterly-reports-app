@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import ReportsList from './pages/ReportsList';
 import CreateReport from './pages/CreateReport';
 import ReportDetail from './pages/ReportDetail';
+import AnnualReports from './pages/AnnualReports';
 import './App.css';
 
 function App() {
@@ -18,6 +19,7 @@ function App() {
             <ul className="nav-links">
               <li><a href="/">All Reports</a></li>
               <li><a href="/create">Create Report</a></li>
+              <li><a href="/annual-reports">Annual Reports</a></li>
             </ul>
           </div>
         </nav>
@@ -26,6 +28,7 @@ function App() {
           <Route path="/" element={<ReportsList />} />
           <Route path="/create" element={<CreateReport />} />
           <Route path="/report/:id" element={<ReportDetail />} />
+          <Route path="/annual-reports" element={<AnnualReports />} />
         </Routes>
       </div>
     </Router>

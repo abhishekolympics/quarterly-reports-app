@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const reportRoutes = require('./routes/reports');
+const annualReportsRoutes = require('./routes/annualReports');
 
 const app = express();
 
@@ -16,6 +17,7 @@ connectDB();
 
 // Routes
 app.use('/api', reportRoutes);
+app.use('/api', annualReportsRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
