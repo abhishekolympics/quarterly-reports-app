@@ -1,7 +1,7 @@
 import React from 'react';
 import SectorPerformance from './SectorPerformance';
+import YearComparison from './YearComparison';
 import '../styles/analyticsPage.css';
-
 
 const AnalyticsDisplay = ({ analysis }) => {
   if (!analysis) return <div>Loading...</div>;
@@ -98,6 +98,8 @@ const AnalyticsDisplay = ({ analysis }) => {
           <li><strong>Trend:</strong> {metrics.yearTotal.sp500 > 0 ? 'Positive year' : 'Negative year'} with {metrics.yearTotal.sp500}% total return</li>
         </ul>
       </div>
+
+      <YearComparison />
     </div>
   );
 };

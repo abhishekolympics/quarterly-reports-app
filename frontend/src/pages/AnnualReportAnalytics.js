@@ -4,8 +4,9 @@ import axios from 'axios';
 import AnalyticsDisplay from '../components/AnalyticsDisplay';
 import ChartsDisplay from '../components/ChartsDisplay';
 import MarketDriversDisplay from '../components/MarketDriversDisplay';
-import { analyzeAnnualReport } from '../components/MarketAnalytics';
 import ExecutiveSummary from '../components/ExecutiveSummary';
+import DataSourcesCard from '../components/DataSourcesCard';
+import { analyzeAnnualReport } from '../components/MarketAnalytics';
 import '../styles/analyticsPage.css';
 
 const AnnualReportAnalytics = () => {
@@ -46,6 +47,7 @@ const AnnualReportAnalytics = () => {
         <h1>📊 Annual Report Analytics</h1>
         <p className="subtitle">Year {report.year}</p>
       </div>
+      
       <ExecutiveSummary analysis={analysis} />
 
       <div className="tabs">
@@ -74,6 +76,8 @@ const AnnualReportAnalytics = () => {
         {activeTab === 'drivers' && <MarketDriversDisplay analysis={analysis} />}
         {activeTab === 'charts' && <ChartsDisplay analysis={analysis} />}
       </div>
+
+      <DataSourcesCard report={report} />
     </div>
   );
 };
