@@ -6,6 +6,7 @@ import ChartsDisplay from '../components/ChartsDisplay';
 import MarketDriversDisplay from '../components/MarketDriversDisplay';
 import ExecutiveSummary from '../components/ExecutiveSummary';
 import DataSourcesCard from '../components/DataSourcesCard';
+import ResearchCopilot from '../components/ResearchCopilot';
 import { analyzeAnnualReport } from '../components/MarketAnalytics';
 import '../styles/analyticsPage.css';
 
@@ -78,6 +79,8 @@ const AnnualReportAnalytics = () => {
       </div>
 
       <DataSourcesCard report={report} />
+      
+      <ResearchCopilot analysis={analysis} report={report} />
     </div>
   );
 };
