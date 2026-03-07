@@ -204,3 +204,20 @@
   color: #999;
   margin-top: 10px;
 }
+
+.btn-analytics {
+  background: #7c3aed;
+  color: white;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95em;
+  text-decoration: none;
+  display: inline-block;
+  transition: background 0.3s ease;
+}
+
+.btn-analytics:hover {
+  background: #6d28d9;
+}

@@ -359,11 +359,27 @@ Q4_BULLET: [Your Q4 bullet point here]`;
   }
 };
 
+const generateContent = async (prompt) => {
+  try {
+    const model = client.getGenerativeModel({ model: 'gemini-3.1-flash-lite-preview' }, { apiVersion: 'v1beta' });
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    console.log('[GeminiService] Generated content:', text.substring(0, 100) + '...');
+    return text;
+  } catch (error) {
+    console.error('[GeminiService] Error:', error.message);
+    throw error;
+  }
+};
+
 
 
 
 module.exports = {
   generateReportNarrative,
   generateSummary,
-  generateAnnualNarratives
+  generateAnnualNarratives,
+  generateContent
 };

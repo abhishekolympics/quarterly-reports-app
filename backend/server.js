@@ -4,6 +4,7 @@ const cors = require('cors');
 const connectDB = require('./config/db');
 const reportRoutes = require('./routes/reports');
 const annualReportsRoutes = require('./routes/annualReports');
+const geminiRoutes = require('./routes/gemini');
 
 const app = express();
 
@@ -18,6 +19,7 @@ connectDB();
 // Routes
 app.use('/api', reportRoutes);
 app.use('/api', annualReportsRoutes);
+app.use('/api/gemini', geminiRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

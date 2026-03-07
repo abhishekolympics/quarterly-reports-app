@@ -4,6 +4,7 @@ import ReportsList from './pages/ReportsList';
 import CreateReport from './pages/CreateReport';
 import ReportDetail from './pages/ReportDetail';
 import AnnualReports from './pages/AnnualReports';
+import AnnualReportAnalytics from './pages/AnnualReportAnalytics';
 import './App.css';
 
 function App() {
@@ -29,6 +30,7 @@ function App() {
           <Route path="/create" element={<CreateReport />} />
           <Route path="/report/:id" element={<ReportDetail />} />
           <Route path="/annual-reports" element={<AnnualReports />} />
+          <Route path="/annual-reports/:id/analytics" element={<AnnualReportAnalytics />} />
         </Routes>
       </div>
     </Router>

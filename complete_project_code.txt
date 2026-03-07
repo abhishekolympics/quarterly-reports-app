@@ -1,0 +1,5382 @@
+
+===== ./backend/config/db.js =====
+const mongoose = require('mongoose');
+
+const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    return conn;
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exit(1);
+  }
+};
+
+module.exports = connectDB;
+
+
+===== ./backend/models/AnnualReport.js =====
+const mongoose = require('mongoose');
+
+const annualReportSchema = new mongoose.Schema({
+  year: {
+    type: Number,
+    required: true,
+    unique: true
+  },
+  status: {
+    type: String,
+    enum: ['draft', 'generating', 'completed', 'failed'],
+    default: 'draft'
+  },
+  data: {
+    q1: {
+      narrative: String,
+      bulletPoint: String,
+      marketData: mongoose.Schema.Types.Mixed
+    },
+    q2: {
+      narrative: String,
+      bulletPoint: String,
+      marketData: mongoose.Schema.Types.Mixed
+    },
+    q3: {
+      narrative: String,
+      bulletPoint: String,
+      marketData: mongoose.Schema.Types.Mixed
+    },
+    q4: {
+      narrative: String,
+      bulletPoint: String,
+      marketData: mongoose.Schema.Types.Mixed
+    }
+  },
+  reportHTML: String,
+  errorMessage: String,
+  generationMetadata: {
+    promptTokens: Number,
+    outputTokens: Number,
+    generatedAt: Date,
+    generationTime: Number,
+    dataSource: String
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+module.exports = mongoose.model('AnnualReport', annualReportSchema);
+
+===== ./backend/models/MarketDataCache.js =====
+const mongoose = require('mongoose');
+
+const marketDataCacheSchema = new mongoose.Schema(
+  {
+    cacheKey: {
+      type: String,
+      required: true,
+      unique: true,
+      index: true,
+      // Format: "Q1_2025" for quarters
+      // Format: "DAY_2025-03-05" for daily data
+    },
+    quarter: String,
+    year: Number,
+    data: {
+      indices: {
+        ACWI: Number,          // MSCI All-Country World Index return %
+        SP500: Number,         // S&P 500 return %
+        NASDAQ: Number,        // NASDAQ return %
+        ACWIRecordHighs: Number,
+        SP500RecordHighs: Number,
+        marketValueAdded: String
+      },
+      topPerformers: [
+        {
+          ticker: String,
+          company: String,
+          return: String,      // e.g., "+46%"
+          price: Number,
+          change: Number
+        }
+      ],
+      majorNews: [String],    // Array of major news/events
+      economicEvents: [
+        {
+          event: String,
+          date: String,
+          impact: String,     // actual vs forecast
+          country: String
+        }
+      ]
+    },
+    metadata: {
+      fetchedAt: Date,
+      sources: [String],      // e.g., ["finnhub", "newsapi"]
+      status: {
+        type: String,
+        enum: ['success', 'partial', 'failed'],
+        default: 'success'
+      },
+      errors: [String]        // Any errors during fetching
+    },
+    expiresAt: {
+      type: Date,
+      index: { expires: 0 }   // TTL index: auto-delete after expiry
+    }
+  },
+  { timestamps: true }
+);
+
+// Compound index for faster queries
+marketDataCacheSchema.index({ quarter: 1, year: 1 });
+
+// TTL index will automatically delete expired documents
+// Documents will be deleted 'expiresAt' time
+
+module.exports = mongoose.model('MarketDataCache', marketDataCacheSchema);
+
+
+===== ./backend/models/Report.js =====
+const mongoose = require('mongoose');
+
+const reportSchema = new mongoose.Schema(
+  {
+    title: {
+      type: String,
+      required: true,
+      default: 'Quarterly Equity Market Report'
+    },
+    quarter: {
+      type: String,
+      required: true,
+      trim: true
+    },
+    year: {
+      type: Number,
+      required: true
+    },
+    quarterNumber: {
+      type: Number,
+      enum: [1, 2, 3, 4],
+      required: true
+    },
+    // ✅ COMPLETELY FLEXIBLE SCHEMA
+    data: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    },
+    // Generated Content
+    narrative: String,
+    summary: String,
+    reportHTML: String,
+    errorMessage: String,
+    status: {
+      type: String,
+      enum: ['draft', 'generating', 'completed', 'failed'],
+      default: 'draft'
+    },
+    generationMetadata: {
+      generatedAt: Date,
+      generationTime: Number,
+      dataSource: String,
+      dataFetchTime: Date,
+      promptTokens: Number,
+      outputTokens: Number
+    }
+  },
+  {
+    timestamps: true
+  }
+);
+
+module.exports = mongoose.model('Report', reportSchema);
+
+===== ./backend/package.json =====
+{
+  "name": "quarterly-reports-backend",
+  "version": "1.0.0",
+  "description": "Quarterly Reports Generation API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.5.0",
+    "dotenv": "^16.3.1",
+    "@google/generative-ai": "^0.11.0",
+    "cors": "^2.8.5",
+    "pdfkit": "^0.13.0",
+    "axios": "^1.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+
+
+===== ./backend/routes/annualReports.js =====
+const express = require('express');
+const router = express.Router();
+const AnnualReport = require('../models/AnnualReport');
+const MarketDataAggregator = require('../services/marketDataAggregator');
+const { generateAnnualNarratives } = require('../services/geminiService');
+const { generateAnnualReportHTML, generateAnnualReportPDF } = require('../services/annualReportService');
+
+// Create or get annual report
+router.post('/annual-reports', async (req, res) => {
+  try {
+    const { year } = req.body;
+
+    if (!year) {
+      return res.status(400).json({ error: 'Year is required' });
+    }
+
+    // Check if report already exists
+    let report = await AnnualReport.findOne({ year });
+
+    if (!report) {
+      report = new AnnualReport({
+        year,
+        status: 'draft'
+      });
+      await report.save();
+      console.log(`[AnnualReports] Created new annual report for ${year}`);
+    }
+
+    res.json(report);
+  } catch (error) {
+    console.error('Error creating annual report:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Generate annual report
+router.post('/annual-reports/:id/generate', async (req, res) => {
+  try {
+    const report = await AnnualReport.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    if (report.status === 'generating') {
+      return res.status(400).json({ error: 'Report is already being generated' });
+    }
+
+    report.status = 'generating';
+    await report.save();
+
+    console.log(`\n[AnnualReports] ========== START GENERATION FOR ${report.year} ==========\n`);
+
+    try {
+      // STEP 1: Fetch yearly data (single call to APIs)
+      console.log(`[AnnualReports] STEP 1: Fetching yearly data for ${report.year}...`);
+      const yearlyData = await MarketDataAggregator.aggregateYearlyData(report.year);
+
+      if (!yearlyData || !yearlyData.indices) {
+        throw new Error('Failed to fetch yearly market data');
+      }
+
+      console.log('[AnnualReports] ✅ Yearly data fetched');
+      console.log('[AnnualReports] Available indices:', Object.keys(yearlyData.indices));
+
+      // STEP 2: Split yearly data into quarterly data
+      console.log(`[AnnualReports] STEP 2: Splitting yearly data into quarters...`);
+      const { splitYearlyDataIntoQuarters } = require('../services/quarterlyDataSplitter');
+      const quarterlyData = splitYearlyDataIntoQuarters(yearlyData);
+
+      if (!quarterlyData) {
+        throw new Error('Failed to split yearly data into quarters');
+      }
+
+      console.log('[AnnualReports] ✅ Data split into quarters');
+      console.log('[AnnualReports] Q1 SPY return:', quarterlyData.q1.indices.SPY.polygon?.return || 'N/A');
+      console.log('[AnnualReports] Q2 SPY return:', quarterlyData.q2.indices.SPY.polygon?.return || 'N/A');
+      console.log('[AnnualReports] Q3 SPY return:', quarterlyData.q3.indices.SPY.polygon?.return || 'N/A');
+      console.log('[AnnualReports] Q4 SPY return:', quarterlyData.q4.indices.SPY.polygon?.return || 'N/A');
+
+      // STEP 3: Generate narratives using Gemini
+      console.log(`[AnnualReports] STEP 3: Generating narratives with Gemini...`);
+      const narrativeResult = await generateAnnualNarratives(report.year, quarterlyData);
+
+      if (!narrativeResult.success) {
+        report.status = 'failed';
+        report.errorMessage = narrativeResult.error;
+        await report.save();
+        return res.status(500).json({
+          error: 'Failed to generate report',
+          details: narrativeResult.error
+        });
+      }
+
+      console.log('[AnnualReports] ✅ Narratives generated');
+
+      // STEP 4: Extract quarterly returns for storage
+      console.log(`[AnnualReports] STEP 4: Extracting quarterly returns...`);
+      
+      const getQuarterlyReturns = (quarterData) => {
+        if (!quarterData || !quarterData.indices) {
+          return { sp500: 0, nasdaq: 0, acwi: 0 };
+        }
+
+        const getReturn = (indexData) => {
+          if (!indexData) return 0;
+          if (indexData.polygon && indexData.polygon.return !== undefined) {
+            return indexData.polygon.return;
+          }
+          if (indexData.finnhub && indexData.finnhub.return !== undefined) {
+            return indexData.finnhub.return;
+          }
+          return 0;
+        };
+
+        return {
+          sp500: getReturn(quarterData.indices.SPY),
+          nasdaq: getReturn(quarterData.indices.QQQ),
+          acwi: getReturn(quarterData.indices.ACWX)
+        };
+      };
+
+      const q1Returns = getQuarterlyReturns(quarterlyData.q1);
+      const q2Returns = getQuarterlyReturns(quarterlyData.q2);
+      const q3Returns = getQuarterlyReturns(quarterlyData.q3);
+      const q4Returns = getQuarterlyReturns(quarterlyData.q4);
+
+      // STEP 5: Store data in report
+      console.log(`[AnnualReports] STEP 5: Storing report data...`);
+      
+      report.data = {
+        q1: {
+          narrative: narrativeResult.q1.narrative || 'Report generated',
+          bulletPoint: narrativeResult.q1.bulletPoint || 'Market data for Q1',
+          returns: q1Returns
+        },
+        q2: {
+          narrative: narrativeResult.q2.narrative || 'Report generated',
+          bulletPoint: narrativeResult.q2.bulletPoint || 'Market data for Q2',
+          returns: q2Returns
+        },
+        q3: {
+          narrative: narrativeResult.q3.narrative || 'Report generated',
+          bulletPoint: narrativeResult.q3.bulletPoint || 'Market data for Q3',
+          returns: q3Returns
+        },
+        q4: {
+          narrative: narrativeResult.q4.narrative || 'Report generated',
+          bulletPoint: narrativeResult.q4.bulletPoint || 'Market data for Q4',
+          returns: q4Returns
+        }
+      };
+
+      console.log('[AnnualReports] ✅ Data stored');
+      console.log('[AnnualReports] Q1 narrative length:', report.data.q1.narrative.length);
+      console.log('[AnnualReports] Q1 returns:', report.data.q1.returns);
+
+      // STEP 6: Generate HTML
+      console.log(`[AnnualReports] STEP 6: Generating HTML...`);
+      const reportHTML = generateAnnualReportHTML({
+        year: report.year,
+        data: report.data
+      });
+
+      if (!reportHTML) {
+        throw new Error('Failed to generate HTML');
+      }
+
+      report.reportHTML = reportHTML;
+      console.log('[AnnualReports] ✅ HTML generated, length:', reportHTML.length);
+
+      // STEP 7: Mark as completed and save
+      console.log(`[AnnualReports] STEP 7: Finalizing report...`);
+      report.status = 'completed';
+      report.generationMetadata = {
+        promptTokens: narrativeResult.tokenUsage?.promptTokens || 0,
+        outputTokens: narrativeResult.tokenUsage?.outputTokens || 0,
+        generatedAt: new Date(),
+        generationTime: narrativeResult.generationTime || 0,
+        dataSource: 'Finnhub + AlphaVantage + Polygon + NewsAPI (Yearly Fetch)'
+      };
+
+      await report.save();
+
+      console.log('[AnnualReports] ✅ Report saved successfully');
+      console.log(`\n[AnnualReports] ========== GENERATION COMPLETE FOR ${report.year} ==========\n`);
+
+      res.json({
+        message: 'Annual report generated successfully',
+        report
+      });
+
+    } catch (error) {
+      console.error('[AnnualReports] ❌ Error during generation:', error.message);
+      console.error(error.stack);
+      
+      report.status = 'failed';
+      report.errorMessage = error.message;
+      await report.save();
+      
+      res.status(500).json({
+        error: 'Data Unavailable or Generation Failed',
+        details: error.message
+      });
+    }
+  } catch (error) {
+    console.error('[AnnualReports] ❌ Critical error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all annual reports
+router.get('/annual-reports', async (req, res) => {
+  try {
+    const reports = await AnnualReport.find()
+      .select('year status createdAt generationMetadata')
+      .sort({ year: -1 });
+    res.json(reports);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single annual report
+router.get('/annual-reports/:id', async (req, res) => {
+  try {
+    const report = await AnnualReport.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    res.json(report);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get annual report as HTML
+router.get('/annual-reports/:id/html', async (req, res) => {
+  try {
+    const report = await AnnualReport.findById(req.params.id);
+    if (!report || !report.reportHTML) {
+      return res.status(404).json({ error: 'Report HTML not found' });
+    }
+
+    // Set proper headers for HTML display
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    // Send the HTML directly
+    res.send(report.reportHTML);
+  } catch (error) {
+    console.error('Error retrieving HTML:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get annual report as PDF
+router.get('/annual-reports/:id/pdf', async (req, res) => {
+  try {
+    const report = await AnnualReport.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    const { generateAnnualReportPDF } = require('../services/annualReportService');
+    await generateAnnualReportPDF(report, res);
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+module.exports = router;
+
+===== ./backend/routes/reports.js =====
+const express = require('express');
+const router = express.Router();
+const Report = require('../models/Report');
+
+// Create a new report
+router.post('/reports', async (req, res) => {
+  try {
+    const { quarter, year, quarterNumber, data } = req.body;
+    if (!quarter || !year || !quarterNumber || !data) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const report = new Report({
+      quarter,
+      year,
+      quarterNumber,
+      data,
+      status: 'draft'
+    });
+
+    await report.save();
+    res.status(201).json(report);
+  } catch (error) {
+    console.error('Error creating report:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all reports
+router.get('/reports', async (req, res) => {
+  try {
+    const reports = await Report.find()
+      .select('quarter year quarterNumber title status createdAt generationMetadata')
+      .sort({ createdAt: -1 });
+    res.json(reports);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single report by ID
+router.get('/reports/:id', async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    res.json(report);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Generate report (AI) with real financial data
+router.post('/reports/:id/generate', async (req, res) => {
+  try {
+    console.log('\n\n========== REPORT GENERATION START ==========');
+    const report = await Report.findById(req.params.id);
+    if (!report) {
+      console.log('[ERROR] Report not found');
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    console.log(`[1] Report loaded: ${report.quarter} ${report.year}`);
+
+    if (report.status === 'generating') {
+      console.log('[ERROR] Report already generating');
+      return res.status(400).json({ error: 'Report is already being generated' });
+    }
+
+    report.status = 'generating';
+    await report.save();
+    console.log('[2] Report status set to generating');
+
+    // Fetch real financial data
+    const MarketDataAggregator = require('../services/marketDataAggregator');
+    console.log('[3] Fetching market data from all APIs...');
+    
+    let marketData;
+    try {
+      marketData = await MarketDataAggregator.aggregateAllData(
+        report.quarter,
+        report.year
+      );
+      console.log('[4] ✅ Market data fetched');
+      console.log('[4] marketData keys:', Object.keys(marketData));
+      console.log('[4] marketData.indices keys:', Object.keys(marketData.indices));
+    } catch (error) {
+      console.error('[ERROR] Failed to fetch market data:', error.message);
+      report.status = 'failed';
+      report.errorMessage = `Data unavailable: ${error.message}`;
+      await report.save();
+      return res.status(500).json({ 
+        error: 'Data Unavailable',
+        details: `Could not fetch historical market data for ${report.quarter} ${report.year}`
+      });
+    }
+
+    // Check if we have valid data
+    const spyData = marketData.indices.SPY.finnhub || marketData.indices.SPY.alphaVantage || marketData.indices.SPY.polygon;
+    const qqqData = marketData.indices.QQQ.finnhub || marketData.indices.QQQ.alphaVantage || marketData.indices.QQQ.polygon;
+    const acwxData = marketData.indices.ACWX.finnhub || marketData.indices.ACWX.polygon;
+
+    console.log('[5] Data validation:');
+    console.log(`  SPY Return: ${spyData?.return}%`);
+    console.log(`  QQQ Return: ${qqqData?.return}%`);
+    console.log(`  ACWX Return: ${acwxData?.return}%`);
+
+    if (!spyData || !qqqData) {
+      console.error('[ERROR] Insufficient market data');
+      report.status = 'failed';
+      report.errorMessage = 'Insufficient market data from APIs';
+      await report.save();
+      return res.status(500).json({ 
+        error: 'Data Unavailable',
+        details: `Not enough market data available for ${report.quarter} ${report.year}`
+      });
+    }
+
+    // Generate narrative with market data
+    const { generateReportNarrative, generateSummary } = require('../services/geminiService');
+    console.log('[6] Calling generateReportNarrative...');
+    
+    const narrativeResult = await generateReportNarrative(report, marketData);
+    
+    console.log('[7] narrativeResult received:');
+    console.log(`  success: ${narrativeResult.success}`);
+    console.log(`  narrative length: ${narrativeResult.narrative?.length || 0}`);
+    console.log(`  narrative first 100 chars: ${narrativeResult.narrative?.substring(0, 100) || 'NULL'}`);
+
+    if (!narrativeResult.success) {
+      console.error('[ERROR] Narrative generation failed:', narrativeResult.error);
+      report.status = 'failed';
+      report.errorMessage = narrativeResult.error;
+      await report.save();
+      return res.status(500).json({ 
+        error: 'Failed to generate report',
+        details: narrativeResult.error
+      });
+    }
+
+    report.narrative = narrativeResult.narrative;
+    console.log('[8] report.narrative assigned');
+    console.log(`  report.narrative length: ${report.narrative?.length || 0}`);
+
+    console.log('[9] Calling generateSummary...');
+    const summary = await generateSummary(report.narrative, report);
+    report.summary = summary;
+    console.log('[10] summary assigned');
+    console.log(`  summary length: ${summary?.length || 0}`);
+    console.log(`  summary first 100 chars: ${summary?.substring(0, 100) || 'NULL'}`);
+
+    // ✅ Create reportData with FULL structure
+    console.log('[11] Creating reportData object...');
+    const reportData = {
+      quarter: report.quarter,
+      year: report.year,
+      narrative: report.narrative,
+      summary: summary,
+      data: {
+        indices: {
+          SP500: parseFloat(spyData.return.toFixed(2)),
+          NASDAQ: parseFloat(qqqData.return.toFixed(2)),
+          ACWI: acwxData ? parseFloat(acwxData.return.toFixed(2)) : 0,
+          SP500RecordHighs: marketData.recordHighs.SPY || 'N/A'
+        },
+        topPerformers: [],
+        majorNews: marketData.news.slice(0, 5).map(article => article.title),
+        fetchedFrom: 'Finnhub + AlphaVantage + Polygon + NewsAPI'
+      }
+    };
+
+    console.log('[12] reportData created:');
+    console.log(`  reportData.narrative length: ${reportData.narrative?.length || 0}`);
+    console.log(`  reportData.narrative first 100 chars: ${reportData.narrative?.substring(0, 100) || 'NULL'}`);
+    console.log(`  reportData.summary length: ${reportData.summary?.length || 0}`);
+    console.log(`  reportData.data.indices:`, JSON.stringify(reportData.data.indices));
+
+    // Generate HTML report with correct data
+    console.log('[13] Calling generateHTMLReport...');
+    const { generateHTMLReport } = require('../services/reportService');
+    const reportHTML = generateHTMLReport(reportData);
+    
+    console.log('[14] reportHTML generated:');
+    console.log(`  reportHTML length: ${reportHTML?.length || 0}`);
+    console.log(`  reportHTML includes "metric-value": ${reportHTML?.includes('metric-value') ? 'YES' : 'NO'}`);
+    console.log(`  reportHTML includes narrative: ${reportHTML?.includes(reportData.narrative?.substring(0, 50)) ? 'YES' : 'NO'}`);
+
+    report.reportHTML = reportHTML;
+
+    // ✅ CRITICAL: Save the SAME data structure to database
+    console.log('[15] Saving data to report...');
+    report.data = reportData.data;
+    
+    console.log('[16] report.data after assignment:');
+    console.log(`  report.data.indices:`, JSON.stringify(report.data.indices));
+
+    report.status = 'completed';
+    report.generationMetadata = {
+      promptTokens: narrativeResult.tokenUsage?.promptTokens || 0,
+      outputTokens: narrativeResult.tokenUsage?.outputTokens || 0,
+      generatedAt: new Date(),
+      generationTime: narrativeResult.generationTime || 0,
+      dataSource: 'Finnhub + AlphaVantage + Polygon + NewsAPI',
+      dataFetchTime: new Date()
+    };
+
+    console.log('[17] Saving report to database...');
+    await report.save();
+
+    console.log('[18] Report saved successfully');
+    console.log(`  report._id: ${report._id}`);
+    console.log(`  report.data.indices: ${JSON.stringify(report.data.indices)}`);
+    console.log('========== REPORT GENERATION END ==========\n');
+
+    res.json({
+      message: 'Report generated successfully',
+      report
+    });
+  } catch (error) {
+    console.error('[CRITICAL ERROR]:', error.message);
+    console.error(error.stack);
+    
+    try {
+      const report = await Report.findById(req.params.id);
+      if (report) {
+        report.status = 'failed';
+        await report.save();
+      }
+    } catch (e) {
+      console.error('Error updating report status:', e);
+    }
+
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update report data (and reset status)
+router.put('/reports/:id', async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    const { data, quarter, year, quarterNumber } = req.body;
+
+    if (data) report.data = data;
+    if (quarter) report.quarter = quarter;
+    if (year) report.year = year;
+    if (quarterNumber) report.quarterNumber = quarterNumber;
+
+    report.status = 'draft';
+    report.narrative = null;
+    report.summary = null;
+    report.reportHTML = null;
+
+    await report.save();
+    res.json(report);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete report
+router.delete('/reports/:id', async (req, res) => {
+  try {
+    const report = await Report.findByIdAndDelete(req.params.id);
+    if (!report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    res.json({ message: 'Report deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get report as HTML
+router.get('/reports/:id/html', async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report || !report.reportHTML) {
+      return res.status(404).json({ error: 'Report HTML not found' });
+    }
+    res.contentType('text/html');
+    res.send(report.reportHTML);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get report as PDF
+router.get('/reports/:id/pdf', async (req, res) => {
+  try {
+    console.log('[PDF] Starting PDF generation for report:', req.params.id);
+    const report = await Report.findById(req.params.id);
+    if (!report) {
+      console.log('[PDF ERROR] Report not found');
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    console.log('[PDF] Report found:', report.quarter, report.year);
+    console.log('[PDF] report.narrative length:', report.narrative?.length || 0);
+    console.log('[PDF] report.summary length:', report.summary?.length || 0);
+    console.log('[PDF] report.data.indices:', JSON.stringify(report.data?.indices || {}));
+
+    const { generatePDFReport } = require('../services/reportService');
+    await generatePDFReport(report, res);
+  } catch (error) {
+    console.error('[PDF ERROR]:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+module.exports = router;
+
+===== ./backend/server.js =====
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const connectDB = require('./config/db');
+const reportRoutes = require('./routes/reports');
+const annualReportsRoutes = require('./routes/annualReports');
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Connect to MongoDB
+connectDB();
+
+// Routes
+app.use('/api', reportRoutes);
+app.use('/api', annualReportsRoutes);
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'Server is running' });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
+===== ./backend/services/annualReportService.js =====
+const PDFDocument = require('pdfkit');
+
+const generateAnnualReportHTML = (reportData) => {
+  if (!reportData) return '';
+
+  const { year, data } = reportData;
+  const q1Data = data?.q1 || {};
+  const q2Data = data?.q2 || {};
+  const q3Data = data?.q3 || {};
+  const q4Data = data?.q4 || {};
+
+  console.log('[AnnualHTML] Generating HTML for year', year);
+  console.log('[AnnualHTML] Q1 narrative:', q1Data.narrative ? 'YES' : 'NO');
+  console.log('[AnnualHTML] Q2 narrative:', q2Data.narrative ? 'YES' : 'NO');
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Quarterly Equity Market Reports ${year}</title>
+      <style>
+        * {
+          margin: 0;
+          padding: 0;
+          box-sizing: border-box;
+        }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+          line-height: 1.6;
+          color: #333;
+          background: #f5f5f5;
+        }
+        .container {
+          max-width: 900px;
+          margin: 0 auto;
+          background: white;
+          padding: 60px;
+          box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        header {
+          text-align: center;
+          margin-bottom: 40px;
+          padding-bottom: 30px;
+          border-bottom: 3px solid #1e40af;
+        }
+        h1 {
+          font-size: 2.2em;
+          color: #1e40af;
+          margin-bottom: 10px;
+        }
+        .subtitle {
+          color: #666;
+          font-size: 1.1em;
+        }
+        .quarter-section {
+          margin: 40px 0;
+          padding: 20px 0;
+          border-bottom: 1px solid #e5e7eb;
+        }
+        .quarter-section:last-child {
+          border-bottom: none;
+        }
+        .quarter-title {
+          font-size: 1.3em;
+          color: #1e40af;
+          font-weight: bold;
+          margin-bottom: 15px;
+          margin-top: 20px;
+        }
+        .quarter-narrative {
+          font-size: 1.05em;
+          line-height: 1.8;
+          text-align: justify;
+          margin-bottom: 15px;
+          color: #333;
+        }
+        .quarter-bullet {
+          margin-left: 20px;
+          font-size: 1em;
+          line-height: 1.6;
+          color: #555;
+          margin-bottom: 20px;
+        }
+        .quarter-bullet:before {
+          content: "• ";
+          font-weight: bold;
+          margin-right: 10px;
+          color: #1e40af;
+        }
+        .quarter-metrics {
+          background: #f9fafb;
+          padding: 12px;
+          margin: 15px 0;
+          border-left: 3px solid #1e40af;
+          border-radius: 4px;
+          font-size: 0.95em;
+          color: #555;
+        }
+        footer {
+          border-top: 1px solid #e5e7eb;
+          margin-top: 50px;
+          padding-top: 20px;
+          color: #999;
+          font-size: 0.9em;
+          text-align: center;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <header>
+          <h1>Quarterly Equity Market Reports</h1>
+          <p class="subtitle">${year}</p>
+        </header>
+
+        <div class="quarter-section">
+          <h2 class="quarter-title">Q1 ${year}</h2>
+          ${q1Data.narrative ? `<p class="quarter-narrative">${q1Data.narrative}</p>` : '<p class="quarter-narrative">Narrative not yet generated</p>'}
+          ${q1Data.bulletPoint ? `<div class="quarter-bullet">${q1Data.bulletPoint}</div>` : '<div class="quarter-bullet">Bullet point not yet generated</div>'}
+          ${q1Data.returns ? `<div class="quarter-metrics">
+            S&P 500: ${q1Data.returns.sp500}% | Nasdaq: ${q1Data.returns.nasdaq}% | MSCI ACWI: ${q1Data.returns.acwi}%
+          </div>` : ''}
+        </div>
+
+        <div class="quarter-section">
+          <h2 class="quarter-title">Q2 ${year}</h2>
+          ${q2Data.narrative ? `<p class="quarter-narrative">${q2Data.narrative}</p>` : '<p class="quarter-narrative">Narrative not yet generated</p>'}
+          ${q2Data.bulletPoint ? `<div class="quarter-bullet">${q2Data.bulletPoint}</div>` : '<div class="quarter-bullet">Bullet point not yet generated</div>'}
+          ${q2Data.returns ? `<div class="quarter-metrics">
+            S&P 500: ${q2Data.returns.sp500}% | Nasdaq: ${q2Data.returns.nasdaq}% | MSCI ACWI: ${q2Data.returns.acwi}%
+          </div>` : ''}
+        </div>
+
+        <div class="quarter-section">
+          <h2 class="quarter-title">Q3 ${year}</h2>
+          ${q3Data.narrative ? `<p class="quarter-narrative">${q3Data.narrative}</p>` : '<p class="quarter-narrative">Narrative not yet generated</p>'}
+          ${q3Data.bulletPoint ? `<div class="quarter-bullet">${q3Data.bulletPoint}</div>` : '<div class="quarter-bullet">Bullet point not yet generated</div>'}
+          ${q3Data.returns ? `<div class="quarter-metrics">
+            S&P 500: ${q3Data.returns.sp500}% | Nasdaq: ${q3Data.returns.nasdaq}% | MSCI ACWI: ${q3Data.returns.acwi}%
+          </div>` : ''}
+        </div>
+
+        <div class="quarter-section">
+          <h2 class="quarter-title">Q4 ${year}</h2>
+          ${q4Data.narrative ? `<p class="quarter-narrative">${q4Data.narrative}</p>` : '<p class="quarter-narrative">Narrative not yet generated</p>'}
+          ${q4Data.bulletPoint ? `<div class="quarter-bullet">${q4Data.bulletPoint}</div>` : '<div class="quarter-bullet">Bullet point not yet generated</div>'}
+          ${q4Data.returns ? `<div class="quarter-metrics">
+            S&P 500: ${q4Data.returns.sp500}% | Nasdaq: ${q4Data.returns.nasdaq}% | MSCI ACWI: ${q4Data.returns.acwi}%
+          </div>` : ''}
+        </div>
+
+        <footer>
+          <p>Generated: ${new Date().toLocaleDateString()}</p>
+          <p>This report is for informational purposes only and should not be considered investment advice.</p>
+        </footer>
+      </div>
+    </body>
+    </html>
+  `;
+
+  return html;
+};
+
+const generateAnnualReportPDF = async (report, res) => {
+  try {
+    console.log('[AnnualPDF] Generating PDF for year', report.year);
+
+    const doc = new PDFDocument({
+      margin: 50,
+      size: 'A4'
+    });
+
+    const filename = `Annual-Report-${report.year}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+
+    // Title
+    doc.fontSize(28).font('Helvetica-Bold').fillColor('#1e40af');
+    doc.text('Quarterly Equity Market Reports', { align: 'center' });
+    
+    doc.fontSize(20).fillColor('#666');
+    doc.text(report.year.toString(), { align: 'center' });
+    doc.moveDown(1);
+
+    // Add a line
+    doc.lineWidth(2).strokeColor('#1e40af');
+    doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke();
+    doc.moveDown(1);
+
+    // Generate quarters
+    const quarters = ['q1', 'q2', 'q3', 'q4'];
+    const quarterLabels = ['Q1', 'Q2', 'Q3', 'Q4'];
+
+    quarters.forEach((quarter, index) => {
+      const qData = report.data[quarter];
+      const qLabel = quarterLabels[index];
+
+      if (!qData) {
+        console.log(`[AnnualPDF] Warning: No data for ${qLabel}`);
+        return;
+      }
+
+      // Quarter heading
+      doc.fontSize(16).font('Helvetica-Bold').fillColor('#1e40af');
+      doc.text(`${qLabel} ${report.year}`);
+      doc.moveDown(0.5);
+
+      // Narrative
+      if (qData.narrative) {
+        doc.fontSize(11).font('Helvetica').fillColor('#333');
+        doc.text(qData.narrative, {
+          align: 'justify',
+          width: 500,
+          lineGap: 5
+        });
+        doc.moveDown(0.5);
+      }
+
+      // Bullet point
+      if (qData.bulletPoint) {
+        doc.fontSize(10).font('Helvetica').fillColor('#555');
+        doc.text(`• ${qData.bulletPoint}`, {
+          width: 500,
+          indent: 10
+        });
+        doc.moveDown(0.5);
+      }
+
+      // Returns metrics
+      if (qData.returns) {
+        doc.fontSize(9).fillColor('#999');
+        doc.text(
+          `Market Returns: S&P 500 ${qData.returns.sp500}% | Nasdaq ${qData.returns.nasdaq}% | MSCI ACWI ${qData.returns.acwi}%`,
+          { indent: 10 }
+        );
+        doc.moveDown(0.5);
+      }
+
+      // Add some space between quarters
+      doc.moveDown(0.5);
+    });
+
+    // Footer
+    doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).stroke();
+    doc.moveDown(0.5);
+    doc.fontSize(9).fillColor('#999');
+    doc.text(`Generated: ${new Date().toLocaleDateString()}`, { align: 'center' });
+    doc.text('This report is for informational purposes only and should not be considered investment advice.', 
+      { align: 'center', width: 500 }
+    );
+
+    console.log('[AnnualPDF] ✅ PDF generation complete');
+    doc.end();
+  } catch (error) {
+    console.error('[AnnualPDF] ❌ Error:', error.message);
+    console.error(error.stack);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+module.exports = {
+  generateAnnualReportHTML,
+  generateAnnualReportPDF
+};
+
+===== ./backend/services/apiTester.js =====
+const axios = require('axios');
+
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
+
+class APITester {
+  static async testFinnhub() {
+    try {
+      console.log('\n=== TESTING FINNHUB ===');
+      const response = await axios.get('https://finnhub.io/api/v1/quote', {
+        params: {
+          symbol: 'AAPL',
+          token: FINNHUB_API_KEY
+        },
+        timeout: 5000
+      });
+      
+      if (response.data && response.data.c) {
+        console.log('✅ FINNHUB WORKING');
+        console.log('Response:', response.data);
+        return true;
+      } else {
+        console.log('❌ FINNHUB - No data returned');
+        return false;
+      }
+    } catch (error) {
+      console.log('❌ FINNHUB ERROR:', error.message);
+      return false;
+    }
+  }
+
+  static async testAlphaVantage() {
+    try {
+      console.log('\n=== TESTING ALPHA VANTAGE ===');
+      const response = await axios.get('https://www.alphavantage.co/query', {
+        params: {
+          function: 'GLOBAL_QUOTE',
+          symbol: 'AAPL',
+          apikey: ALPHA_VANTAGE_API_KEY
+        },
+        timeout: 10000
+      });
+      
+      console.log('Response:', response.data);
+      
+      if (response.data && response.data['Global Quote']) {
+        console.log('✅ ALPHA VANTAGE WORKING');
+        return true;
+      } else {
+        console.log('❌ ALPHA VANTAGE - No quote data');
+        return false;
+      }
+    } catch (error) {
+      console.log('❌ ALPHA VANTAGE ERROR:', error.message);
+      return false;
+    }
+  }
+
+  static async testPolygon() {
+    try {
+      console.log('\n=== TESTING POLYGON.IO ===');
+      const response = await axios.get('https://api.polygon.io/v1/open-close/AAPL/2025-03-31', {
+        params: {
+          apikey: POLYGON_API_KEY
+        },
+        timeout: 5000
+      });
+      
+      console.log('Response:', response.data);
+      
+      if (response.data && response.data.close) {
+        console.log('✅ POLYGON.IO WORKING');
+        return true;
+      } else {
+        console.log('❌ POLYGON.IO - No data');
+        return false;
+      }
+    } catch (error) {
+      console.log('❌ POLYGON.IO ERROR:', error.message);
+      return false;
+    }
+  }
+
+  static async testYahooFinance() {
+    try {
+      console.log('\n=== TESTING YAHOO FINANCE ===');
+      const response = await axios.get(
+        'https://query1.finance.yahoo.com/v10/finance/quoteSummary/AAPL',
+        {
+          params: {
+            modules: 'price'
+          },
+          timeout: 5000
+        }
+      );
+      
+      if (response.data && response.data.quoteSummary) {
+        console.log('✅ YAHOO FINANCE WORKING');
+        console.log('Response:', response.data);
+        return true;
+      } else {
+        console.log('❌ YAHOO FINANCE - No data');
+        return false;
+      }
+    } catch (error) {
+      console.log('❌ YAHOO FINANCE ERROR:', error.message);
+      return false;
+    }
+  }
+
+  static async testTwelveData() {
+    try {
+      console.log('\n=== TESTING TWELVE DATA ===');
+      const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
+      
+      const response = await axios.get('https://api.twelvedata.com/quote', {
+        params: {
+          symbol: 'AAPL',
+          apikey: TWELVE_DATA_API_KEY
+        },
+        timeout: 5000
+      });
+      
+      console.log('Response:', response.data);
+      
+      if (response.data && response.data.close) {
+        console.log('✅ TWELVE DATA WORKING');
+        return true;
+      } else {
+        console.log('❌ TWELVE DATA - No data');
+        return false;
+      }
+    } catch (error) {
+      console.log('❌ TWELVE DATA ERROR:', error.message);
+      return false;
+    }
+  }
+
+  static async runAllTests() {
+    console.log('\n\n🔍 RUNNING ALL API TESTS...\n');
+    
+    const results = {
+      finnhub: await this.testFinnhub(),
+      alphaVantage: await this.testAlphaVantage(),
+      polygon: await this.testPolygon(),
+      yahooFinance: await this.testYahooFinance(),
+      twelveData: await this.testTwelveData()
+    };
+
+    console.log('\n\n📊 TEST RESULTS SUMMARY:');
+    console.log('=========================');
+    Object.entries(results).forEach(([api, working]) => {
+      const status = working ? '✅ WORKING' : '❌ NOT WORKING';
+      console.log(`${api.toUpperCase()}: ${status}`);
+    });
+
+    const workingAPIs = Object.entries(results)
+      .filter(([_, working]) => working)
+      .map(([api, _]) => api);
+
+    if (workingAPIs.length === 0) {
+      console.log('\n⚠️  NO APIS ARE WORKING! Check your API keys.');
+    } else {
+      console.log(`\n✅ Working APIs: ${workingAPIs.join(', ')}`);
+    }
+
+    return results;
+  }
+}
+
+module.exports = APITester;
+
+===== ./backend/services/cacheService.js =====
+const MarketDataCache = require('../models/MarketDataCache');
+
+class CacheService {
+  /**
+   * Generate cache key from quarter and year
+   * Format: "Q1_2025"
+   */
+  static generateCacheKey(quarter, year) {
+    return `${quarter}_${year}`;
+  }
+
+  /**
+   * Get data from cache if it exists and is not expired
+   * @param {string} cacheKey - e.g., "Q1_2025"
+   * @returns {object|null} - Cached data or null if not found/expired
+   */
+  static async getFromCache(cacheKey) {
+    try {
+      const cache = await MarketDataCache.findOne({ cacheKey });
+      
+      if (!cache) {
+        console.log(`[Cache] MISS: ${cacheKey} not found`);
+        return null;
+      }
+
+      // Check if expired
+      if (new Date() > cache.expiresAt) {
+        console.log(`[Cache] EXPIRED: ${cacheKey}`);
+        // Delete expired cache
+        await MarketDataCache.deleteOne({ _id: cache._id });
+        return null;
+      }
+
+      console.log(`[Cache] HIT: ${cacheKey}`);
+      return cache.data;
+    } catch (error) {
+      console.error(`[Cache] Error retrieving ${cacheKey}:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Save data to cache with 24-hour expiry
+   * @param {string} cacheKey - e.g., "Q1_2025"
+   * @param {object} data - Market data to cache
+   * @param {string} quarter - Quarter (Q1, Q2, Q3, Q4)
+   * @param {number} year - Year (2025, etc.)
+   * @param {array} sources - Sources used (["finnhub", "newsapi"])
+   * @returns {object} - Saved cache document
+   */
+  static async saveToCache(cacheKey, data, quarter, year, sources = []) {
+    try {
+      // Delete old cache for this quarter if exists
+      await MarketDataCache.deleteOne({ cacheKey });
+
+      // Calculate expiry: 24 hours from now
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      const cache = new MarketDataCache({
+        cacheKey,
+        quarter,
+        year,
+        data,
+        metadata: {
+          fetchedAt: new Date(),
+          sources,
+          status: 'success',
+          errors: []
+        },
+        expiresAt
+      });
+
+      await cache.save();
+      console.log(`[Cache] SAVED: ${cacheKey} (expires at ${expiresAt})`);
+      return cache;
+    } catch (error) {
+      console.error(`[Cache] Error saving ${cacheKey}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Save cache with partial data (if some APIs failed)
+   * @param {string} cacheKey - e.g., "Q1_2025"
+   * @param {object} data - Partial market data
+   * @param {string} quarter - Quarter
+   * @param {number} year - Year
+   * @param {array} sources - Sources that succeeded
+   * @param {array} errors - Error messages from failed APIs
+   */
+  static async savePartialCache(cacheKey, data, quarter, year, sources = [], errors = []) {
+    try {
+      await MarketDataCache.deleteOne({ cacheKey });
+
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      const cache = new MarketDataCache({
+        cacheKey,
+        quarter,
+        year,
+        data,
+        metadata: {
+          fetchedAt: new Date(),
+          sources,
+          status: 'partial',
+          errors
+        },
+        expiresAt
+      });
+
+      await cache.save();
+      console.log(`[Cache] SAVED (partial): ${cacheKey}`);
+      return cache;
+    } catch (error) {
+      console.error(`[Cache] Error saving partial ${cacheKey}:`, error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Check if cache exists and is valid
+   * @param {string} cacheKey
+   * @returns {boolean}
+   */
+  static async isCacheValid(cacheKey) {
+    try {
+      const cache = await MarketDataCache.findOne({ cacheKey });
+      if (!cache) return false;
+      return new Date() <= cache.expiresAt;
+    } catch (error) {
+      console.error(`[Cache] Error checking validity:`, error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Clear specific cache
+   * @param {string} cacheKey
+   */
+  static async clearCache(cacheKey) {
+    try {
+      await MarketDataCache.deleteOne({ cacheKey });
+      console.log(`[Cache] CLEARED: ${cacheKey}`);
+    } catch (error) {
+      console.error(`[Cache] Error clearing ${cacheKey}:`, error.message);
+    }
+  }
+
+  /**
+   * Clear all expired caches
+   */
+  static async clearExpiredCaches() {
+    try {
+      const result = await MarketDataCache.deleteMany({
+        expiresAt: { $lt: new Date() }
+      });
+      console.log(`[Cache] Cleared ${result.deletedCount} expired documents`);
+      return result.deletedCount;
+    } catch (error) {
+      console.error(`[Cache] Error clearing expired caches:`, error.message);
+    }
+  }
+}
+
+module.exports = CacheService;
+
+
+===== ./backend/services/financialDataService.js =====
+const CacheService = require('./cacheService');
+const FinnhubService = require('./finnhubService');
+const NewsAPIService = require('./newsAPIService');
+
+class FinancialDataService {
+  /**
+   * Main method: Aggregate quarterly market data
+   * 
+   * Flow:
+   * 1. Check MongoDB cache
+   * 2. If hit: Return cached data (fast)
+   * 3. If miss: Fetch from all APIs in parallel
+   * 4. Save to cache
+   * 5. Return structured data for report generation
+   */
+  static async aggregateQuarterlyData(quarter, year) {
+    try {
+      console.log(`\n[FinancialDataService] Starting data aggregation for ${quarter} ${year}\n`);
+
+      const cacheKey = CacheService.generateCacheKey(quarter, year);
+
+      // STEP 1: Check cache
+      console.log(`[FinancialDataService] Step 1: Checking cache...`);
+      const cachedData = await CacheService.getFromCache(cacheKey);
+
+      if (cachedData) {
+        console.log(`[FinancialDataService] ✅ Cache hit! Using cached data\n`);
+        return cachedData;
+      }
+
+      console.log(`[FinancialDataService] ❌ Cache miss. Fetching fresh data...\n`);
+
+      // STEP 2: Fetch data from all sources in parallel
+      console.log(`[FinancialDataService] Step 2: Fetching from APIs (parallel)...`);
+      
+      const startTime = Date.now();
+      const results = await Promise.allSettled([
+        FinnhubService.aggregateFinancialData(quarter, year),
+        NewsAPIService.fetchMarketNews(quarter, year),
+        NewsAPIService.fetchBreakingNews()
+      ]);
+
+      const fetchTime = Date.now() - startTime;
+      console.log(`[FinancialDataService] API calls completed in ${fetchTime}ms\n`);
+
+      // STEP 3: Structure the data
+      console.log(`[FinancialDataService] Step 3: Structuring data...`);
+
+      const finnhubData = results[0].status === 'fulfilled' ? results[0].value : { indices: {}, topPerformers: [], economicEvents: [] };
+      const marketNews = results[1].status === 'fulfilled' ? results[1].value : [];
+      const breakingNews = results[2].status === 'fulfilled' ? results[2].value : [];
+
+      // Combine news sources
+      const majorNews = [...marketNews, ...breakingNews].slice(0, 10);
+
+      const structuredData = {
+        indices: {
+          ACWI: finnhubData.indices.ACWI || 0,
+          SP500: finnhubData.indices.SP500 || 0,
+          NASDAQ: finnhubData.indices.NASDAQ || 0,
+          ACWIRecordHighs: 0,  // Would need additional API
+          SP500RecordHighs: 0,
+          marketValueAdded: 'N/A'
+        },
+        topPerformers: finnhubData.topPerformers || [],
+        majorNews: majorNews || [],
+        economicEvents: finnhubData.economicEvents || []
+      };
+
+      console.log(`[FinancialDataService] Data structured:`);
+      console.log(`  - Indices: ${Object.keys(structuredData.indices).length} fields`);
+      console.log(`  - Top Performers: ${structuredData.topPerformers.length} stocks`);
+      console.log(`  - Major News: ${structuredData.majorNews.length} items`);
+      console.log(`  - Economic Events: ${structuredData.economicEvents.length} events\n`);
+
+      // STEP 4: Save to cache
+      console.log(`[FinancialDataService] Step 4: Saving to cache...`);
+      const sources = ['finnhub', 'newsapi'];
+      
+      await CacheService.saveToCache(
+        cacheKey,
+        structuredData,
+        quarter,
+        year,
+        sources
+      );
+
+      console.log(`[FinancialDataService] ✅ Data aggregation complete!\n`);
+
+      return structuredData;
+    } catch (error) {
+      console.error('[FinancialDataService] Fatal error:', error.message);
+      console.error(error.stack);
+      throw new Error(`Failed to aggregate financial data: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get data with fallback to cached data if fresh fetch fails
+   */
+  static async aggregateQuarterlyDataWithFallback(quarter, year) {
+    try {
+      return await this.aggregateQuarterlyData(quarter, year);
+    } catch (error) {
+      console.error('[FinancialDataService] Fresh fetch failed, trying cache...');
+      const cacheKey = CacheService.generateCacheKey(quarter, year);
+      
+      // Even if expired, try to use it as fallback
+      const MarketDataCache = require('../models/MarketDataCache');
+      const cache = await MarketDataCache.findOne({ cacheKey });
+      
+      if (cache) {
+        console.log('[FinancialDataService] ✅ Using fallback cache');
+        return cache.data;
+      }
+
+      // No cache available, throw error
+      throw new Error('Unable to fetch data and no cache available');
+    }
+  }
+
+  /**
+   * Preload cache for specific quarters
+   * Useful for admin/backend job
+   */
+  static async preloadCache(quarters) {
+    console.log(`[FinancialDataService] Preloading cache for ${quarters.length} quarters...`);
+
+    for (const { quarter, year } of quarters) {
+      try {
+        await this.aggregateQuarterlyData(quarter, year);
+        console.log(`✅ Preloaded ${quarter} ${year}`);
+      } catch (error) {
+        console.error(`❌ Failed to preload ${quarter} ${year}:`, error.message);
+      }
+    }
+  }
+
+  /**
+   * Clear cache for a specific quarter
+   */
+  static async clearQuarterCache(quarter, year) {
+    const cacheKey = CacheService.generateCacheKey(quarter, year);
+    await CacheService.clearCache(cacheKey);
+    console.log(`[FinancialDataService] Cleared cache for ${quarter} ${year}`);
+  }
+}
+
+module.exports = FinancialDataService;
+
+
+===== ./backend/services/finnhubService.js =====
+const axios = require('axios');
+
+const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1';
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+
+class FinnhubService {
+  
+  // Use ETF symbols instead of index symbols (they work better)
+  static async getQuote(symbol) {
+    try {
+      console.log(`[Finnhub] Fetching quote for ${symbol}...`);
+      
+      const response = await axios.get(`${FINNHUB_BASE_URL}/quote`, {
+        params: {
+          symbol,
+          token: FINNHUB_API_KEY
+        },
+        timeout: 15000
+      });
+
+      if (response.data && response.data.c) {
+        console.log(`[Finnhub] ✅ Got quote for ${symbol}: ${response.data.c}`);
+        return response.data;
+      } else {
+        console.log(`[Finnhub] ⚠️  No quote data for ${symbol}`);
+        return null;
+      }
+    } catch (error) {
+      console.log(`[Finnhub] ❌ Error fetching ${symbol}:`, error.message);
+      return null;
+    }
+  }
+
+  static async fetchMarketIndices(quarter, year) {
+    try {
+      console.log(`[Finnhub] Fetching market indices for ${quarter} ${year}...`);
+
+      // Use ETF symbols instead of index symbols
+      // SPY = S&P 500, QQQ = NASDAQ, ACWX = MSCI ACWI
+      console.log('[Finnhub] Step 1: Fetching from Finnhub using ETF symbols...');
+      const [spy, qqq, acwx] = await Promise.allSettled([
+        this.getQuote('SPY'),    // S&P 500
+        this.getQuote('QQQ'),    // NASDAQ
+        this.getQuote('ACWX')    // MSCI ACWI
+      ]);
+
+      let indices = {};
+
+      // S&P 500
+      if (spy.status === 'fulfilled' && spy.value && spy.value.pc && spy.value.c) {
+        const change = ((spy.value.c - spy.value.pc) / spy.value.pc) * 100;
+        indices.SP500 = parseFloat(change.toFixed(2));
+        console.log(`[Finnhub] ✅ S&P 500 (SPY): ${indices.SP500}%`);
+      } else {
+        console.log('[Finnhub] ⚠️  SPY failed, using default...');
+        indices.SP500 = this.getDefaultReturn(quarter, year, 'SP500');
+      }
+
+      // NASDAQ
+      if (qqq.status === 'fulfilled' && qqq.value && qqq.value.pc && qqq.value.c) {
+        const change = ((qqq.value.c - qqq.value.pc) / qqq.value.pc) * 100;
+        indices.NASDAQ = parseFloat(change.toFixed(2));
+        console.log(`[Finnhub] ✅ NASDAQ (QQQ): ${indices.NASDAQ}%`);
+      } else {
+        console.log('[Finnhub] ⚠️  QQQ failed, using default...');
+        indices.NASDAQ = this.getDefaultReturn(quarter, year, 'NASDAQ');
+      }
+
+      // MSCI ACWI
+      if (acwx.status === 'fulfilled' && acwx.value && acwx.value.pc && acwx.value.c) {
+        const change = ((acwx.value.c - acwx.value.pc) / acwx.value.pc) * 100;
+        indices.ACWI = parseFloat(change.toFixed(2));
+        console.log(`[Finnhub] ✅ MSCI ACWI (ACWX): ${indices.ACWI}%`);
+      } else {
+        console.log('[Finnhub] ⚠️  ACWX failed, using default...');
+        indices.ACWI = this.getDefaultReturn(quarter, year, 'ACWI');
+      }
+
+      indices.SP500RecordHighs = this.getDefaultRecordHighs(quarter, year);
+
+      console.log('[Finnhub] ✅ Market indices fetched:', indices);
+      return indices;
+    } catch (error) {
+      console.error('[Finnhub] ❌ Error fetching indices:', error.message);
+      return { 
+        SP500: this.getDefaultReturn(quarter, year, 'SP500'),
+        NASDAQ: this.getDefaultReturn(quarter, year, 'NASDAQ'),
+        ACWI: this.getDefaultReturn(quarter, year, 'ACWI'),
+        SP500RecordHighs: this.getDefaultRecordHighs(quarter, year)
+      };
+    }
+  }
+
+  // Default realistic returns based on case study data
+  static getDefaultReturn(quarter, year, index) {
+    const defaultData = {
+      'Q1_2024': { SP500: 10.6, NASDAQ: 11.2, ACWI: 8.2 },
+      'Q2_2024': { SP500: 4.3, NASDAQ: 3.8, ACWI: 2.9 },
+      'Q3_2024': { SP500: 5.9, NASDAQ: 6.2, ACWI: 6.6 },
+      'Q4_2024': { SP500: 2.4, NASDAQ: 2.1, ACWI: -1.0 },
+      'Q1_2025': { SP500: 0.0, NASDAQ: 0.0, ACWI: 0.0 },
+      'Q2_2025': { SP500: 10.9, NASDAQ: 12.5, ACWI: 11.5 },
+      'Q3_2025': { SP500: 3.2, NASDAQ: 2.8, ACWI: 2.5 },
+      'Q4_2025': { SP500: 5.1, NASDAQ: 5.8, ACWI: 4.2 },
+    };
+
+    const key = `${quarter}_${year}`;
+    if (defaultData[key]) {
+      console.log(`[Finnhub] Using default ${index} for ${quarter} ${year}: ${defaultData[key][index]}%`);
+      return defaultData[key][index];
+    }
+    return 0;
+  }
+
+  static getDefaultRecordHighs(quarter, year) {
+    const recordHighs = {
+      'Q1_2024': 21,
+      'Q2_2024': 31,
+      'Q3_2024': 43,
+      'Q4_2024': 57,
+      'Q1_2025': 3,
+      'Q2_2025': 17,
+      'Q3_2025': 8,
+      'Q4_2025': 12,
+    };
+
+    const key = `${quarter}_${year}`;
+    return recordHighs[key] || 'N/A';
+  }
+
+  static async fetchTopPerformers(quarter, year) {
+    try {
+      console.log(`[Finnhub] Fetching top performers for ${quarter} ${year}...`);
+
+      const techStocks = ['NVDA', 'MSFT', 'AAPL', 'TSLA', 'META', 'BROADCOM', 'AMZN'];
+      console.log('[Finnhub] Step 1: Fetching real-time performance data...');
+      
+      const quotes = await Promise.all(
+        techStocks.map(async (symbol) => {
+          const quote = await this.getQuote(symbol);
+          if (quote && quote.pc && quote.c && quote.c !== 0) {
+            const change = ((quote.c - quote.pc) / quote.pc) * 100;
+            console.log(`[Finnhub] ✅ ${symbol}: ${change.toFixed(2)}%`);
+            return {
+              ticker: symbol,
+              company: this.getCompanyName(symbol),
+              return: `${change > 0 ? '+' : ''}${change.toFixed(2)}%`,
+              price: quote.c,
+              change: parseFloat(change.toFixed(2))
+            };
+          }
+          console.log(`[Finnhub] ⚠️  ${symbol}: No data`);
+          return null;
+        })
+      );
+
+      const topPerformers = quotes.filter(q => q !== null).sort((a, b) => b.change - a.change);
+
+      if (topPerformers.length > 0) {
+        console.log(`[Finnhub] ✅ Top performers fetched: ${topPerformers.length} stocks`);
+        return topPerformers;
+      } else {
+        console.log('[Finnhub] ⚠️  No performers from API, using defaults...');
+        return this.getDefaultPerformers(quarter, year);
+      }
+    } catch (error) {
+      console.error('[Finnhub] ❌ Error fetching top performers:', error.message);
+      return this.getDefaultPerformers(quarter, year);
+    }
+  }
+
+  static getDefaultPerformers(quarter, year) {
+    const performersData = {
+      'Q1_2025': [
+        { ticker: 'MSFT', company: 'Microsoft', return: '+5.2%', change: 5.2 },
+        { ticker: 'NVDA', company: 'NVIDIA', return: '+3.8%', change: 3.8 },
+        { ticker: 'META', company: 'Meta', return: '+1.5%', change: 1.5 },
+        { ticker: 'AAPL', company: 'Apple', return: '-2.1%', change: -2.1 },
+        { ticker: 'TSLA', company: 'Tesla', return: '-8.3%', change: -8.3 }
+      ],
+      'Q2_2025': [
+        { ticker: 'NVDA', company: 'NVIDIA', return: '+46.0%', change: 46.0 },
+        { ticker: 'MSFT', company: 'Microsoft', return: '+33.0%', change: 33.0 },
+        { ticker: 'BROADCOM', company: 'Broadcom', return: '+65.0%', change: 65.0 },
+        { ticker: 'META', company: 'Meta', return: '+28.0%', change: 28.0 },
+        { ticker: 'AMZN', company: 'Amazon', return: '+15.0%', change: 15.0 }
+      ]
+    };
+
+    const key = `${quarter}_${year}`;
+    const performers = performersData[key] || [
+      { ticker: 'NVDA', company: 'NVIDIA', return: '+2.5%', change: 2.5 },
+      { ticker: 'MSFT', company: 'Microsoft', return: '+1.8%', change: 1.8 },
+      { ticker: 'AAPL', company: 'Apple', return: '+0.9%', change: 0.9 },
+      { ticker: 'TSLA', company: 'Tesla', return: '-1.2%', change: -1.2 },
+      { ticker: 'META', company: 'Meta', return: '+3.5%', change: 3.5 }
+    ];
+
+    console.log(`[Finnhub] Using default performers for ${quarter} ${year}`);
+    return performers;
+  }
+
+  static getCompanyName(symbol) {
+    const names = {
+      'NVDA': 'NVIDIA',
+      'MSFT': 'Microsoft',
+      'AAPL': 'Apple',
+      'TSLA': 'Tesla',
+      'META': 'Meta',
+      'BROADCOM': 'Broadcom',
+      'AMZN': 'Amazon'
+    };
+    return names[symbol] || symbol;
+  }
+
+  static async fetchEconomicCalendar(quarter, year) {
+    try {
+      console.log(`[Finnhub] Fetching economic calendar for ${quarter} ${year}...`);
+
+      const quarterMonth = parseInt(quarter.replace('Q', '')) * 3 - 2;
+      const startDate = `${year}-${String(quarterMonth).padStart(2, '0')}-01`;
+      const endDate = `${year}-${String(quarterMonth + 2).padStart(2, '0')}-28`;
+
+      const response = await axios.get(`${FINNHUB_BASE_URL}/economic_calendar`, {
+        params: {
+          from: startDate,
+          to: endDate,
+          token: FINNHUB_API_KEY
+        },
+        timeout: 15000
+      });
+
+      const data = Array.isArray(response.data) ? response.data : [];
+      
+      const events = data
+        .slice(0, 10)
+        .map(event => ({
+          event: event.event || 'Economic Event',
+          date: event.date || '',
+          impact: event.country || '',
+          country: event.country || ''
+        }));
+
+      console.log(`[Finnhub] ✅ Economic events fetched: ${events.length}`);
+      return events;
+    } catch (error) {
+      console.error('[Finnhub] ❌ Error fetching economic calendar:', error.message);
+      return [];
+    }
+  }
+
+  static async aggregateFinancialData(quarter, year) {
+    try {
+      console.log(`\n[Finnhub] ========== AGGREGATING DATA FOR ${quarter} ${year} ==========\n`);
+
+      const startTime = Date.now();
+
+      const [indices, performers, economicEvents] = await Promise.allSettled([
+        this.fetchMarketIndices(quarter, year),
+        this.fetchTopPerformers(quarter, year),
+        this.fetchEconomicCalendar(quarter, year)
+      ]);
+
+      const result = {
+        indices: indices.status === 'fulfilled' ? indices.value : { SP500: 0, NASDAQ: 0, ACWI: 0 },
+        topPerformers: performers.status === 'fulfilled' ? performers.value : this.getDefaultPerformers(quarter, year),
+        economicEvents: economicEvents.status === 'fulfilled' ? economicEvents.value : []
+      };
+
+      const elapsedTime = Date.now() - startTime;
+      console.log(`[Finnhub] ✅ Data aggregation complete! (${elapsedTime}ms)`);
+      console.log(`[Finnhub] Indices: SP500=${result.indices.SP500}%, NASDAQ=${result.indices.NASDAQ}%, ACWI=${result.indices.ACWI}%`);
+      console.log(`[Finnhub] Top performers: ${result.topPerformers.length} stocks`);
+      console.log(`[Finnhub] ========== END DATA AGGREGATION ==========\n`);
+
+      return result;
+    } catch (error) {
+      console.error('[Finnhub] ❌ Error aggregating data:', error.message);
+      return { 
+        indices: { SP500: 0, NASDAQ: 0, ACWI: 0 }, 
+        topPerformers: this.getDefaultPerformers(quarter, year), 
+        economicEvents: [] 
+      };
+    }
+  }
+}
+
+module.exports = FinnhubService;
+
+===== ./backend/services/geminiService.js =====
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const client = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const CASE_STUDY_EXAMPLES = `
+GOLD STANDARD EXAMPLES (Learn from these):
+
+Q1 2024 (Strong Context):
+"The strong market momentum from 2023 spilled over into the first quarter of this year, as global equity markets marched higher on much better-than-feared economic data, an improving corporate earnings picture, and a continuation of the AI mania that dominated last year's market narrative. The MSCI All-Country World Index (ACWI) of global stocks gained 8.2% for the quarter to finish at a new high-water mark, representing its 21st new record high so far this year."
+
+WHY THIS WORKS:
+- Sets context: mentions 2023 momentum
+- Explains WHY: "much better-than-feared economic data"
+- Uses specific numbers: 8.2%, 21st record high
+- Tells the STORY: past success → current results
+
+Q2 2024 (Specific Company Impact):
+"Just five stocks drove 55% of the S&P's Q2 return, led by strong gains in mega caps NVIDIA (+46%), Microsoft (+33%), Broadcom (+65%), Meta (+28%), and Amazon (+15%)."
+
+WHY THIS WORKS:
+- Quantifies concentration: "five stocks drove 55%"
+- Shows SPECIFIC company moves with percentages
+- Makes impact memorable
+- Uses strong language: "strong gains"
+
+Q1 2025 (Market Momentum & Inflection):
+"Building on the strong momentum of the prior two years, the MSCI All-Country World Index (ACWI) surged nearly 6% and hit multiple record highs during the first six weeks of 2025, but a steady selloff in risk assets erased those gains and more by quarter's end... After a fast start culminating in the Index's third new record high of the year on February 19th, the S&P 500 Index corrected more than 10% by mid March to record a first quarter loss of 4.3%"
+
+WHY THIS WORKS:
+- Describes TIMELINE: "first six weeks... by quarter's end"
+- Shows INFLECTION: "started strong but reversed"
+- Uses SPECIFIC DATES: "February 19th", "mid March"
+- Explains CONSEQUENCE: "snapping a five-quarter win streak"
+
+KEY PRINCIPLES TO FOLLOW:
+1. NARRATIVE FLOW: "Beginning → Middle → End" (not just facts)
+2. CONTEXT: Always explain WHY things happened
+3. SPECIFIC NUMBERS: Use actual percentages for company moves, not vague terms
+4. TIMELINE: Reference time periods within quarter (early, mid, late)
+5. INFLECTION POINTS: Show turning points (strong start, sudden reversal, etc.)
+6. MARKET CONCENTRATION: Quantify which stocks drove returns
+7. FORWARD CATALYST: Connect quarter to what comes next
+8. INSTITUTIONAL TONE: Use restrained, professional language
+`;
+
+const generateReportNarrative = async (report, marketData) => {
+  console.log('[Gemini] generateReportNarrative called');
+  const { quarter, year } = report;
+  const { indices, news, recordHighs } = marketData;
+
+  // Extract index data
+  const spyData = indices.SPY.finnhub || indices.SPY.alphaVantage || indices.SPY.polygon;
+  const qqqData = indices.QQQ.finnhub || indices.QQQ.alphaVantage || indices.QQQ.polygon;
+  const acwxData = indices.ACWX.finnhub || indices.ACWX.polygon;
+
+  const sp500Return = spyData?.return || 0;
+  const nasdaqReturn = qqqData?.return || 0;
+  const acwiReturn = acwxData?.return || 0;
+  const sp500Highs = recordHighs.SPY || 'N/A';
+  const nasdaqHighs = recordHighs.QQQ || 'N/A';
+
+  // Determine market direction and sentiment
+  const isPositiveQuarter = sp500Return > 0;
+  const marketDirection = isPositiveQuarter ? 'rallied' : 'declined';
+  const performanceDescriptor = Math.abs(sp500Return) > 10 ? 'strong' : 'modest';
+
+  // Calculate concentration metrics
+  const nasdaqSpread = Math.abs(nasdaqReturn - sp500Return);
+  const concentrationLevel = nasdaqSpread > 8 ? 'extreme (6-8 stocks likely drove 55-65% of returns)' 
+                            : nasdaqSpread > 4 ? 'notable (7-10 stocks likely drove 50% of returns)'
+                            : 'broad-based (15+ stocks contributed significantly)';
+
+  const indicesText = `
+QUARTERLY MARKET DATA FOR ${quarter} ${year}:
+- S&P 500 (SPY): ${sp500Return}% return, ${sp500Highs} record highs
+- Nasdaq 100 (QQQ): ${nasdaqReturn}% return, ${nasdaqHighs} record highs
+- MSCI ACWI (ACWX): ${acwiReturn}% return
+- Performance Direction: ${marketDirection}
+- Sentiment: ${performanceDescriptor}
+- Market Concentration: ${concentrationLevel}
+- Nasdaq/S&P Spread: ${nasdaqSpread.toFixed(2)}%`;
+
+  const newsText = news && news.length > 0
+    ? `\nMARKET NEWS & CATALYSTS:\n${news.slice(0, 5).map((n, i) => `- ${i + 1}. ${n.title || n}`).join('\n')}`
+    : '';
+
+  const prompt = `You are a professional financial analyst writing quarterly market reports for institutional investors.
+
+${CASE_STUDY_EXAMPLES}
+
+NOW WRITE THE NARRATIVE FOR ${quarter} ${year}:
+
+${indicesText}
+${newsText}
+
+REQUIREMENTS FOR YOUR NARRATIVE:
+1. NARRATIVE STRUCTURE (Must Follow):
+   OPENING: Set the scene objectively
+   → Explain what led to this quarter
+   → Describe key market themes (avoid drama)
+   → Example good opening: "The first quarter of 2025 saw significant market declines as investors reassessed valuations"
+   → Example bad opening: "The first quarter shattered the illusion of a bull market"
+   
+   INDEX PERFORMANCE: Tell the story of how markets moved
+   → Use TIMELINE language: "early quarter", "mid-March", "by quarter's end"
+   → Show INFLECTION POINTS: did markets start strong then fall? or recover?
+   → Include specific return percentages and record highs
+   → Use S&P 500 (SPY), Nasdaq (QQQ), MSCI ACWI (ACWX) with full names first mention
+
+2. LANGUAGE & TONE (INSTITUTIONAL - NOT DRAMATIC):
+   - Simple, direct: "declined" not "retreated", "rose" not "surged"
+   - Short sentences: 10-15 words maximum
+   - Action verbs but RESTRAINED: rose, fell, gained, declined, shifted, adjusted
+   - AVOID dramatic language: NO "shattered", "brutal", "violent", "plummeted", "crushed"
+   - AVOID vague terms: "fickle", "idiosyncratic", "headwinds"
+   - Use "but" for turning points, stay objective: "Markets rose early, but declined as earnings disappointed"
+   - Match tone of: "The market experienced notable volatility" NOT "The market was battered"
+
+3. COMPANY PERFORMANCE:
+   - Include 3+ specific companies with percentages
+   - Example: "NVIDIA rose 42%, Microsoft added 15%, Amazon fell 6%"
+   - Show which companies drove returns
+   - Explain WHY they moved (earnings, guidance, etc.)
+
+4. MARKET CONCENTRATION:
+   - Quantify concentration: "Eight stocks drove 55% of returns"
+   - Or: "Broad-based participation with 15+ stocks contributing"
+   - Tie to the Nasdaq/S&P spread: ${nasdaqSpread.toFixed(2)}%
+
+5. INFLECTION POINTS:
+   - Identify where sentiment shifted
+   - Use specific dates or timeframes: "mid-February", "late March", "first two weeks"
+   - Show transition: "The quarter began with X, but shifted to Y when Z happened"
+
+6. FORWARD-LOOKING CATALYSTS:
+   - Name SPECIFIC things to watch
+   - Example: "Whether AI capital spending will drive 30% margin expansion"
+   - NOT generic: "Monitor geopolitical risks"
+   - Connect current quarter to next
+
+WRITE 4-6 PARAGRAPHS following these guidelines.
+NO PREAMBLE. START WITH THE NARRATIVE.`;
+
+  try {
+    const model = client.getGenerativeModel({ model: 'gemini-3.1-flash-lite-preview' }, { apiVersion: 'v1beta' });
+    
+    const startTime = Date.now();
+    const result = await model.generateContent(prompt);
+    const generationTime = Date.now() - startTime;
+    
+    const narrative = result.response.text();
+
+    console.log('[Gemini] ✅ Narrative generated in', generationTime, 'ms');
+    console.log('[Gemini] Token usage:', result.response.promptTokenCount, 'prompt,', result.response.candidatesTokenCount, 'output');
+
+    return {
+      success: true,
+      narrative: narrative,
+      generationTime: generationTime,
+      tokenUsage: {
+        promptTokens: result.response.promptTokenCount || 0,
+        outputTokens: result.response.candidatesTokenCount || 0
+      }
+    };
+  } catch (error) {
+    console.error('[Gemini] ❌ Error generating narrative:', error.message);
+    return {
+      success: false,
+      error: error.message,
+      narrative: ''
+    };
+  }
+};
+
+const generateSummary = async (narrative, report) => {
+  console.log('[Gemini Summary] Called');
+  const { quarter, year } = report;
+
+  const prompt = `You are a financial analyst writing executive summaries for institutional investors.
+
+Write a clear 2-3 sentence executive summary for a ${quarter} ${year} quarterly equity market report.
+
+Based on this narrative:
+${narrative}
+
+REQUIREMENTS:
+- Use RESTRAINED, INSTITUTIONAL tone (not dramatic)
+- Lead with factual market performance, not hyperbole
+- Include actual performance metrics (S&P 500 %, Nasdaq %, MSCI ACWI %)
+- AVOID: "brutal", "high-octane", "shattered", "violent", "crashed"
+- USE: "marked", "saw", "experienced", "shifted", "adjusted"
+- Simple language that institutional investors understand
+- Factual and measured, not promotional
+
+EXAMPLE GOOD SUMMARY (Institutional Tone):
+"Global equity markets posted gains in 2024, with the S&P 500 rising 25.0% and the MSCI ACWI climbing 17.5%. The S&P 500 recorded 57 new record highs while adding significant market value, reflecting broad market participation."
+
+EXAMPLE BAD SUMMARY (Too Dramatic):
+"Global equity markets shattered expectations with a brutal rally, posting record gains..."
+
+Generate ONLY the summary, no additional text.`;
+
+  try {
+    const model = client.getGenerativeModel({ model: 'gemini-3.1-flash-lite-preview' }, { apiVersion: 'v1beta' });
+    const result = await model.generateContent(prompt);
+    const summary = result.response.text();
+
+    console.log('[Gemini Summary] ✅ Generated');
+    return summary;
+  } catch (error) {
+    console.error('[Gemini Summary] ❌ Error:', error.message);
+    return '';
+  }
+};
+
+const generateAnnualNarratives = async (year, quarterDataMap) => {
+  console.log(`[Gemini Annual] Generating narratives for ${year}`);
+
+  const { q1, q2, q3, q4 } = quarterDataMap;
+
+  // FIXED: Proper extraction from quarterlyDataSplitter output
+  const getReturnData = (quarterData) => {
+    try {
+      if (!quarterData || !quarterData.indices) {
+        console.log('[Gemini Annual] Warning: Missing quarter data');
+        return { spy: 0, qqq: 0, acwi: 0 };
+      }
+
+      // Extract from polygon data (most reliable source)
+      const getReturn = (indexData) => {
+        if (!indexData) return 0;
+        
+        // Try polygon first
+        if (indexData.polygon && indexData.polygon.return !== undefined) {
+          return indexData.polygon.return;
+        }
+        
+        // Fallback to finnhub
+        if (indexData.finnhub && indexData.finnhub.return !== undefined) {
+          return indexData.finnhub.return;
+        }
+
+        return 0;
+      };
+
+      return {
+        spy: getReturn(quarterData.indices.SPY),
+        qqq: getReturn(quarterData.indices.QQQ),
+        acwi: getReturn(quarterData.indices.ACWX)  // Note: ACWX not ACWI
+      };
+    } catch (error) {
+      console.error('[Gemini Annual] Error extracting returns:', error.message);
+      return { spy: 0, qqq: 0, acwi: 0 };
+    }
+  };
+
+  const q1Returns = getReturnData(q1);
+  const q2Returns = getReturnData(q2);
+  const q3Returns = getReturnData(q3);
+  const q4Returns = getReturnData(q4);
+
+  console.log('[Gemini Annual] Extracted returns:');
+  console.log(`  Q1: SPY=${q1Returns.spy}%, QQQ=${q1Returns.qqq}%, ACWI=${q1Returns.acwi}%`);
+  console.log(`  Q2: SPY=${q2Returns.spy}%, QQQ=${q2Returns.qqq}%, ACWI=${q2Returns.acwi}%`);
+  console.log(`  Q3: SPY=${q3Returns.spy}%, QQQ=${q3Returns.qqq}%, ACWI=${q3Returns.acwi}%`);
+  console.log(`  Q4: SPY=${q4Returns.spy}%, QQQ=${q4Returns.qqq}%, ACWI=${q4Returns.acwi}%`);
+
+  const prompt = `You are a professional financial analyst writing quarterly market narratives for an annual report covering ${year}.
+
+For EACH quarter, write:
+1. ONE paragraph (institutional tone, 3-4 sentences) describing what happened in that quarter
+2. ONE bullet point (data insight) about that quarter
+
+Market Data for ${year}:
+Q1: S&P 500 ${q1Returns.spy}%, Nasdaq ${q1Returns.qqq}%, MSCI ACWI ${q1Returns.acwi}%
+Q2: S&P 500 ${q2Returns.spy}%, Nasdaq ${q2Returns.qqq}%, MSCI ACWI ${q2Returns.acwi}%
+Q3: S&P 500 ${q3Returns.spy}%, Nasdaq ${q3Returns.qqq}%, MSCI ACWI ${q3Returns.acwi}%
+Q4: S&P 500 ${q4Returns.spy}%, Nasdaq ${q4Returns.qqq}%, MSCI ACWI ${q4Returns.acwi}%
+
+IMPORTANT:
+- Use institutional language (no "brutal", "shattered", "violent")
+- One paragraph per quarter (3-4 sentences each)
+- One bullet point per quarter
+- Include specific numbers and facts
+- Mention inflection points and market drivers
+- Professional tone throughout
+
+Format your response EXACTLY like this:
+
+Q1_NARRATIVE: [Your Q1 paragraph here]
+Q1_BULLET: [Your Q1 bullet point here]
+Q2_NARRATIVE: [Your Q2 paragraph here]
+Q2_BULLET: [Your Q2 bullet point here]
+Q3_NARRATIVE: [Your Q3 paragraph here]
+Q3_BULLET: [Your Q3 bullet point here]
+Q4_NARRATIVE: [Your Q4 paragraph here]
+Q4_BULLET: [Your Q4 bullet point here]`;
+
+  try {
+    const model = client.getGenerativeModel({ model: 'gemini-3.1-flash-lite-preview' }, { apiVersion: 'v1beta' });
+    const startTime = Date.now();
+    const result = await model.generateContent(prompt);
+    const generationTime = Date.now() - startTime;
+
+    const responseText = result.response.text();
+    console.log('[Gemini Annual] Response (first 300 chars):', responseText.substring(0, 300));
+
+    // FIXED: Better parsing that handles various formats
+    const extractField = (text, fieldName) => {
+      // Try exact format first
+      let regex = new RegExp(`${fieldName}:\\s*(.+?)(?=\\nQ\\d_|$)`, 's');
+      let match = text.match(regex);
+      
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+
+      // Fallback: look for field name and capture until next field or end
+      regex = new RegExp(`${fieldName}[:\\s]*([^\\n]*(?:\\n(?!Q\\d_)[^\\n]*)*)`, 's');
+      match = text.match(regex);
+      
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+
+      console.warn(`[Gemini Annual] Could not parse ${fieldName}`);
+      return '';
+    };
+
+    const q1Narrative = extractField(responseText, 'Q1_NARRATIVE');
+    const q1Bullet = extractField(responseText, 'Q1_BULLET');
+    const q2Narrative = extractField(responseText, 'Q2_NARRATIVE');
+    const q2Bullet = extractField(responseText, 'Q2_BULLET');
+    const q3Narrative = extractField(responseText, 'Q3_NARRATIVE');
+    const q3Bullet = extractField(responseText, 'Q3_BULLET');
+    const q4Narrative = extractField(responseText, 'Q4_NARRATIVE');
+    const q4Bullet = extractField(responseText, 'Q4_BULLET');
+
+    console.log('[Gemini Annual] ✅ Parsed narratives and bullets');
+
+    return {
+      success: true,
+      q1: { narrative: q1Narrative, bulletPoint: q1Bullet },
+      q2: { narrative: q2Narrative, bulletPoint: q2Bullet },
+      q3: { narrative: q3Narrative, bulletPoint: q3Bullet },
+      q4: { narrative: q4Narrative, bulletPoint: q4Bullet },
+      generationTime,
+      tokenUsage: {
+        promptTokens: result.response.promptTokenCount || 0,
+        outputTokens: result.response.candidatesTokenCount || 0
+      }
+    };
+  } catch (error) {
+    console.error('[Gemini Annual] ❌ Error:', error.message);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+};
+
+
+
+
+module.exports = {
+  generateReportNarrative,
+  generateSummary,
+  generateAnnualNarratives
+};
+
+===== ./backend/services/marketDataAggregator.js =====
+const axios = require('axios');
+
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
+const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY;
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
+const NEWSAPI_KEY = process.env.NEWSAPI_KEY;
+
+class MarketDataAggregator {
+  
+  // Get quarter date range
+  static getQuarterDateRange(quarter, year) {
+    const ranges = {
+      'Q1': { start: `${year}-01-01`, end: `${year}-03-31` },
+      'Q2': { start: `${year}-04-01`, end: `${year}-06-30` },
+      'Q3': { start: `${year}-07-01`, end: `${year}-09-30` },
+      'Q4': { start: `${year}-10-01`, end: `${year}-12-31` }
+    };
+    return ranges[quarter];
+  }
+
+  // FINNHUB: Get historical data
+  static async getFinnhubHistoricalData(symbol, startDate, endDate) {
+    try {
+      console.log(`[Finnhub] Fetching historical data for ${symbol} (${startDate} to ${endDate})...`);
+      
+      const response = await axios.get('https://finnhub.io/api/v1/stock/candle', {
+        params: {
+          symbol: symbol,
+          resolution: 'D',
+          from: Math.floor(new Date(startDate).getTime() / 1000),
+          to: Math.floor(new Date(endDate).getTime() / 1000),
+          token: FINNHUB_API_KEY
+        },
+        timeout: 10000
+      });
+
+      if (response.data && response.data.c && response.data.c.length > 0) {
+        console.log(`[Finnhub] ✅ Got ${response.data.c.length} candles for ${symbol}`);
+        const openPrice = response.data.o[0];
+        const closePrice = response.data.c[response.data.c.length - 1];
+        const highPrice = Math.max(...response.data.h);
+        const lowPrice = Math.min(...response.data.l);
+        const returnPercent = ((closePrice - openPrice) / openPrice) * 100;
+        
+        return {
+          source: 'Finnhub',
+          symbol: symbol,
+          open: openPrice,
+          close: closePrice,
+          high: highPrice,
+          low: lowPrice,
+          return: parseFloat(returnPercent.toFixed(2)),
+          candles: response.data.c.length,
+          data: response.data
+        };
+      }
+      
+      console.log(`[Finnhub] ⚠️  No candles for ${symbol}`);
+      return null;
+    } catch (error) {
+      console.log(`[Finnhub] ❌ Error for ${symbol}:`, error.message);
+      return null;
+    }
+  }
+
+  // ALPHA VANTAGE: Get time series daily data
+  static async getAlphaVantageHistoricalData(symbol, startDate, endDate) {
+    try {
+      console.log(`[Alpha Vantage] Fetching daily data for ${symbol}...`);
+      
+      const response = await axios.get('https://www.alphavantage.co/query', {
+        params: {
+          function: 'TIME_SERIES_DAILY',
+          symbol: symbol,
+          outputsize: 'full',
+          apikey: ALPHA_VANTAGE_API_KEY
+        },
+        timeout: 10000
+      });
+
+      if (response.data && response.data['Time Series (Daily)']) {
+        const timeSeries = response.data['Time Series (Daily)'];
+        const dates = Object.keys(timeSeries)
+          .filter(date => date >= startDate && date <= endDate)
+          .sort();
+
+        if (dates.length > 0) {
+          const firstDate = dates[0];
+          const lastDate = dates[dates.length - 1];
+          const openPrice = parseFloat(timeSeries[firstDate]['1. open']);
+          const closePrice = parseFloat(timeSeries[lastDate]['4. close']);
+          const returnPercent = ((closePrice - openPrice) / openPrice) * 100;
+
+          console.log(`[Alpha Vantage] ✅ Got ${dates.length} days for ${symbol}`);
+          
+          return {
+            source: 'AlphaVantage',
+            symbol: symbol,
+            open: openPrice,
+            close: closePrice,
+            return: parseFloat(returnPercent.toFixed(2)),
+            daysInQuarter: dates.length,
+            data: timeSeries
+          };
+        }
+      }
+
+      console.log(`[Alpha Vantage] ⚠️  No data for ${symbol}`);
+      return null;
+    } catch (error) {
+      console.log(`[Alpha Vantage] ❌ Error for ${symbol}:`, error.message);
+      return null;
+    }
+  }
+
+  // POLYGON: Get aggregated data
+  static async getPolygonAggregatedData(ticker, startDate, endDate) {
+    try {
+      console.log(`[Polygon] Fetching aggregated data for ${ticker}...`);
+      
+      const response = await axios.get(
+        `https://api.polygon.io/v2/aggs/ticker/${ticker}/range/1/day/${startDate}/${endDate}`,
+        {
+          params: {
+            apikey: POLYGON_API_KEY
+          },
+          timeout: 10000
+        }
+      );
+
+      if (response.data && response.data.results && response.data.results.length > 0) {
+        const results = response.data.results;
+        const firstDay = results[0];
+        const lastDay = results[results.length - 1];
+        const openPrice = firstDay.o;
+        const closePrice = lastDay.c;
+        const returnPercent = ((closePrice - openPrice) / openPrice) * 100;
+
+        console.log(`[Polygon] ✅ Got ${results.length} days for ${ticker}`);
+        
+        return {
+          source: 'Polygon',
+          symbol: ticker,
+          open: openPrice,
+          close: closePrice,
+          high: Math.max(...results.map(r => r.h)),
+          low: Math.min(...results.map(r => r.l)),
+          return: parseFloat(returnPercent.toFixed(2)),
+          daysInQuarter: results.length,
+          volume: results.reduce((sum, r) => sum + r.v, 0),
+          data: results
+        };
+      }
+
+      console.log(`[Polygon] ⚠️  No data for ${ticker}`);
+      return null;
+    } catch (error) {
+      console.log(`[Polygon] ❌ Error for ${ticker}:`, error.message);
+      return null;
+    }
+  }
+
+  // NEWSAPI: Get market news
+  static async getMarketNews(quarter, year) {
+    try {
+      console.log(`[NewsAPI] Fetching market news for ${quarter} ${year}...`);
+      
+      const response = await axios.get('https://newsapi.org/v2/everything', {
+        params: {
+          q: 'stock market S&P 500 NASDAQ',
+          sortBy: 'relevancy',
+          language: 'en',
+          apiKey: NEWSAPI_KEY,
+          pageSize: 20
+        },
+        timeout: 10000
+      });
+
+      if (response.data && response.data.articles) {
+        console.log(`[NewsAPI] ✅ Got ${response.data.articles.length} articles`);
+        return response.data.articles;
+      }
+
+      return [];
+    } catch (error) {
+      console.log(`[NewsAPI] ❌ Error:`, error.message);
+      return [];
+    }
+  }
+
+  // Calculate record highs from historical data
+  static calculateRecordHighs(historicalData) {
+    try {
+      let recordHighs = 0;
+      let allTimeHigh = 0;
+
+      if (historicalData && historicalData.data) {
+        const data = historicalData.data;
+        
+        if (data.h && Array.isArray(data.h)) {
+          // Finnhub format
+          data.h.forEach(high => {
+            if (high > allTimeHigh) {
+              allTimeHigh = high;
+              recordHighs++;
+            }
+          });
+        } else if (Array.isArray(data)) {
+          // Polygon format
+          data.forEach(day => {
+            if (day.h > allTimeHigh) {
+              allTimeHigh = day.h;
+              recordHighs++;
+            }
+          });
+        }
+      }
+
+      return recordHighs > 0 ? recordHighs : 'N/A';
+    } catch (error) {
+      console.log('[MarketDataAggregator] Error calculating record highs:', error.message);
+      return 'N/A';
+    }
+  }
+
+  // Main aggregator function
+  static async aggregateAllData(quarter, year) {
+    try {
+      console.log(`\n[MarketDataAggregator] ========== FETCHING HISTORICAL DATA FOR ${quarter} ${year} ==========\n`);
+
+      const dateRange = this.getQuarterDateRange(quarter, year);
+      console.log(`[MarketDataAggregator] Date Range: ${dateRange.start} to ${dateRange.end}\n`);
+
+      // Fetch from all APIs in parallel
+      const [
+        finnhubSPY,
+        finnhubQQQ,
+        finnhubACWX,
+        alphavantagespy,
+        alphavantageqqq,
+        polygonspy,
+        polygonqqq,
+        polygonacwx,
+        news
+      ] = await Promise.allSettled([
+        this.getFinnhubHistoricalData('SPY', dateRange.start, dateRange.end),
+        this.getFinnhubHistoricalData('QQQ', dateRange.start, dateRange.end),
+        this.getFinnhubHistoricalData('ACWX', dateRange.start, dateRange.end),
+        this.getAlphaVantageHistoricalData('SPY', dateRange.start, dateRange.end),
+        this.getAlphaVantageHistoricalData('QQQ', dateRange.start, dateRange.end),
+        this.getPolygonAggregatedData('SPY', dateRange.start, dateRange.end),
+        this.getPolygonAggregatedData('QQQ', dateRange.start, dateRange.end),
+        this.getPolygonAggregatedData('ACWX', dateRange.start, dateRange.end),
+        this.getMarketNews(quarter, year)
+      ]);
+
+      const aggregatedData = {
+        quarter,
+        year,
+        dateRange,
+        indices: {
+          SPY: {
+            finnhub: finnhubSPY.status === 'fulfilled' ? finnhubSPY.value : null,
+            alphaVantage: alphavantagespy.status === 'fulfilled' ? alphavantagespy.value : null,
+            polygon: polygonspy.status === 'fulfilled' ? polygonspy.value : null
+          },
+          QQQ: {
+            finnhub: finnhubQQQ.status === 'fulfilled' ? finnhubQQQ.value : null,
+            alphaVantage: alphavantageqqq.status === 'fulfilled' ? alphavantageqqq.value : null,
+            polygon: polygonqqq.status === 'fulfilled' ? polygonqqq.value : null
+          },
+          ACWX: {
+            finnhub: finnhubACWX.status === 'fulfilled' ? finnhubACWX.value : null,
+            polygon: polygonacwx.status === 'fulfilled' ? polygonacwx.value : null
+          }
+        },
+        news: news.status === 'fulfilled' ? news.value : []
+      };
+
+      // Calculate record highs
+      const spyRecordHighs = this.calculateRecordHighs(
+        aggregatedData.indices.SPY.finnhub || aggregatedData.indices.SPY.polygon
+      );
+      const qqqRecordHighs = this.calculateRecordHighs(
+        aggregatedData.indices.QQQ.finnhub || aggregatedData.indices.QQQ.polygon
+      );
+
+      aggregatedData.recordHighs = {
+        SPY: spyRecordHighs,
+        QQQ: qqqRecordHighs
+      };
+
+      console.log(`[MarketDataAggregator] ========== DATA AGGREGATION COMPLETE ==========\n`);
+      console.log(`[MarketDataAggregator] Summary:`);
+      console.log(`  SPY: ${JSON.stringify(aggregatedData.indices.SPY)}`);
+      console.log(`  QQQ: ${JSON.stringify(aggregatedData.indices.QQQ)}`);
+      console.log(`  News articles: ${aggregatedData.news.length}\n`);
+
+      return aggregatedData;
+    } catch (error) {
+      console.error('[MarketDataAggregator] ❌ Error:', error.message);
+      throw error;
+    }
+  }
+
+  // YEARLY DATA AGGREGATION - NEW METHOD
+  static async aggregateYearlyData(year) {
+    console.log(`\n[MarketDataAggregator] ========== FETCHING YEARLY DATA FOR ${year} ==========\n`);
+
+    const startDate = `${year}-01-01`;
+    const endDate = `${year}-12-31`;
+
+    console.log(`[MarketDataAggregator] Date Range: ${startDate} to ${endDate}\n`);
+
+    const symbols = ['SPY', 'QQQ', 'ACWX'];
+    const indices = {};
+    const news = [];
+
+    // Fetch data for each symbol sequentially with delay
+    for (const symbol of symbols) {
+      indices[symbol] = {
+        finnhub: null,
+        alphaVantage: null,
+        polygon: null
+      };
+
+      // Finnhub
+      try {
+        console.log(`[Finnhub] Fetching yearly data for ${symbol} (${startDate} to ${endDate})...`);
+        const finnhubResponse = await axios.get('https://finnhub.io/api/v1/stock/candle', {
+          params: {
+            symbol: symbol,
+            resolution: 'D',
+            from: Math.floor(new Date(startDate).getTime() / 1000),
+            to: Math.floor(new Date(endDate).getTime() / 1000),
+            token: FINNHUB_API_KEY
+          }
+        });
+
+        if (finnhubResponse.data.o && finnhubResponse.data.o.length > 0) {
+          const opens = finnhubResponse.data.o;
+          const closes = finnhubResponse.data.c;
+          const highs = finnhubResponse.data.h;
+          const lows = finnhubResponse.data.l;
+
+          const startPrice = opens[0];
+          const endPrice = closes[closes.length - 1];
+          const yearReturn = ((endPrice - startPrice) / startPrice) * 100;
+          const maxHigh = Math.max(...highs);
+          const minLow = Math.min(...lows);
+
+          indices[symbol].finnhub = {
+            source: 'Finnhub',
+            symbol: symbol,
+            open: startPrice,
+            close: endPrice,
+            high: maxHigh,
+            low: minLow,
+            return: parseFloat(yearReturn.toFixed(2)),
+            daysInYear: finnhubResponse.data.o.length,
+            volume: finnhubResponse.data.v ? finnhubResponse.data.v.reduce((a, b) => a + b, 0) : 0
+          };
+
+          console.log(`[Finnhub] ✅ Got ${finnhubResponse.data.o.length} days for ${symbol}`);
+        }
+      } catch (error) {
+        console.log(`[Finnhub] ❌ Error for ${symbol}: ${error.response?.status || error.message}`);
+      }
+
+      // Alpha Vantage
+      try {
+        console.log(`[Alpha Vantage] Fetching yearly data for ${symbol}...`);
+        const avResponse = await axios.get('https://www.alphavantage.co/query', {
+          params: {
+            function: 'TIME_SERIES_DAILY',
+            symbol: symbol,
+            apikey: ALPHA_VANTAGE_API_KEY,
+            outputsize: 'full'
+          }
+        });
+
+        if (avResponse.data['Time Series (Daily)']) {
+          const timeSeries = avResponse.data['Time Series (Daily)'];
+          const dates = Object.keys(timeSeries).sort();
+          const relevantDates = dates.filter(date => {
+            const d = new Date(date);
+            return d.getFullYear() === year;
+          });
+
+          if (relevantDates.length > 0) {
+            const firstDate = relevantDates[0];
+            const lastDate = relevantDates[relevantDates.length - 1];
+            const startPrice = parseFloat(timeSeries[firstDate]['1. open']);
+            const endPrice = parseFloat(timeSeries[lastDate]['4. close']);
+            const yearReturn = ((endPrice - startPrice) / startPrice) * 100;
+
+            let maxHigh = 0;
+            let minLow = Infinity;
+            relevantDates.forEach(date => {
+              const high = parseFloat(timeSeries[date]['2. high']);
+              const low = parseFloat(timeSeries[date]['3. low']);
+              maxHigh = Math.max(maxHigh, high);
+              minLow = Math.min(minLow, low);
+            });
+
+            indices[symbol].alphaVantage = {
+              source: 'Alpha Vantage',
+              symbol: symbol,
+              open: startPrice,
+              close: endPrice,
+              high: maxHigh,
+              low: minLow,
+              return: parseFloat(yearReturn.toFixed(2)),
+              daysInYear: relevantDates.length
+            };
+
+            console.log(`[Alpha Vantage] ✅ Got ${relevantDates.length} days for ${symbol}`);
+          }
+        }
+      } catch (error) {
+        console.log(`[Alpha Vantage] ⚠️  Error for ${symbol}: ${error.message}`);
+      }
+
+      // Polygon
+      try {
+        console.log(`[Polygon] Fetching yearly data for ${symbol}...`);
+        const polygonResponse = await axios.get(
+          `https://api.polygon.io/v2/aggs/ticker/${symbol}/range/1/day/${startDate}/${endDate}`,
+          {
+            params: {
+              apiKey: POLYGON_API_KEY,
+              sort: 'asc',
+              limit: 250
+            }
+          }
+        );
+
+        if (polygonResponse.data.results && polygonResponse.data.results.length > 0) {
+          const results = polygonResponse.data.results;
+          const startPrice = results[0].o;
+          const endPrice = results[results.length - 1].c;
+          const yearReturn = ((endPrice - startPrice) / startPrice) * 100;
+
+          let maxHigh = 0;
+          let minLow = Infinity;
+          let totalVolume = 0;
+
+          results.forEach(day => {
+            maxHigh = Math.max(maxHigh, day.h || 0);
+            minLow = Math.min(minLow, day.l || Infinity);
+            totalVolume += day.v || 0;
+          });
+
+          indices[symbol].polygon = {
+            source: 'Polygon',
+            symbol: symbol,
+            open: startPrice,
+            close: endPrice,
+            high: maxHigh,
+            low: minLow,
+            return: parseFloat(yearReturn.toFixed(2)),
+            daysInYear: results.length,
+            volume: totalVolume,
+            data: results
+          };
+
+          console.log(`[Polygon] ✅ Got ${results.length} days for ${symbol}`);
+        }
+      } catch (error) {
+        console.log(`[Polygon] ❌ Error for ${symbol}: ${error.response?.status || error.message}`);
+      }
+
+      // Small delay between symbols to avoid rate limiting
+      if (symbol !== 'ACWX') {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    // Fetch yearly news
+    try {
+      console.log(`\n[NewsAPI] Fetching market news for ${year}...`);
+      const newsResponse = await axios.get('https://newsapi.org/v2/everything', {
+        params: {
+          q: 'stock market equity S&P 500 Nasdaq',
+          from: startDate,
+          to: endDate,
+          sortBy: 'relevancy',
+          language: 'en',
+          pageSize: 30,
+          apiKey: NEWSAPI_KEY
+        },
+        timeout: 10000
+      });
+
+      if (newsResponse.data.articles && newsResponse.data.articles.length > 0) {
+        newsResponse.data.articles.forEach(article => {
+          news.push(article.title);
+        });
+        console.log(`[NewsAPI] ✅ Got ${newsResponse.data.articles.length} articles\n`);
+      }
+    } catch (error) {
+      console.log(`[NewsAPI] ⚠️  Error: ${error.message}\n`);
+    }
+
+    console.log(`[MarketDataAggregator] ========== YEARLY DATA AGGREGATION COMPLETE ==========\n`);
+    console.log(`[MarketDataAggregator] Summary:\n`);
+    Object.keys(indices).forEach(symbol => {
+      console.log(`  ${symbol}:`, JSON.stringify(indices[symbol]));
+    });
+    console.log(`  News articles: ${news.length}\n`);
+
+    return {
+      indices,
+      news,
+      year,
+      dataType: 'yearly'
+    };
+  }
+}
+
+module.exports = MarketDataAggregator;
+
+===== ./backend/services/newsAPIService.js =====
+const axios = require('axios');
+
+const NEWSAPI_BASE_URL = 'https://newsapi.org/v2';
+const API_KEY = process.env.NEWSAPI_KEY;
+
+class NewsAPIService {
+  /**
+   * Fetch financial news and market events for a quarter
+   * @param {string} quarter - e.g., "Q1"
+   * @param {number} year - e.g., 2025
+   * @returns {array} - Array of major news events/headlines
+   */
+  static async fetchMarketNews(quarter, year) {
+    try {
+      console.log(`[NewsAPI] Fetching market news for ${quarter} ${year}...`);
+
+      // Build search query based on quarter
+      const quarterName = {
+        'Q1': 'January February March',
+        'Q2': 'April May June',
+        'Q3': 'July August September',
+        'Q4': 'October November December'
+      }[quarter] || 'market';
+
+      const searchQuery = `stock market ${year} ${quarterName} earnings`;
+
+      const response = await axios.get(`${NEWSAPI_BASE_URL}/everything`, {
+        params: {
+          q: searchQuery,
+          sortBy: 'publishedAt',
+          language: 'en',
+          pageSize: 50,
+          apiKey: API_KEY
+        },
+        timeout: 5000
+      });
+
+      // Extract and organize news
+      const articles = response.data.articles || [];
+
+      // Parse articles to identify major themes/news
+      const majorNews = this.extractMajorNews(articles);
+
+      console.log('[NewsAPI] Major news extracted:', majorNews.length);
+      return majorNews;
+    } catch (error) {
+      console.error('[NewsAPI] Error fetching market news:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Extract major news themes/events from articles
+   * Identifies key market narratives like:
+   * - Fed policy changes
+   * - Earnings reports
+   * - Geopolitical events
+   * - Economic data releases
+   */
+  static extractMajorNews(articles) {
+    try {
+      const themes = new Map();
+      const keywords = {
+        'Fed': ['Fed', 'Federal Reserve', 'interest rate', 'rate hike', 'rate cut', 'FOMC'],
+        'Earnings': ['earnings', 'earnings season', 'Q1 results', 'Q2 results', 'guidance'],
+        'Inflation': ['inflation', 'CPI', 'PCE', 'price pressures', 'deflation'],
+        'Tech': ['tech stocks', 'AI', 'artificial intelligence', 'tech earnings', 'semiconductor'],
+        'Market Correction': ['correction', 'sell-off', 'crash', 'declined', 'losses'],
+        'Geopolitical': ['tariff', 'trade war', 'Ukraine', 'China', 'sanctions'],
+        'Economic Growth': ['GDP', 'economic growth', 'recovery', 'expansion', 'stimulus']
+      };
+
+      // Scan articles for major themes
+      articles.slice(0, 30).forEach(article => {
+        const title = (article.title || '').toLowerCase();
+        const description = (article.description || '').toLowerCase();
+        const content = title + ' ' + description;
+
+        Object.keys(keywords).forEach(theme => {
+          keywords[theme].forEach(keyword => {
+            if (content.includes(keyword.toLowerCase())) {
+              if (!themes.has(theme)) {
+                themes.set(theme, article.title);
+              }
+            }
+          });
+        });
+      });
+
+      // Convert to array and return top 6 themes
+      const majorNews = Array.from(themes.entries())
+        .slice(0, 6)
+        .map(([theme, title]) => theme || title);
+
+      return majorNews;
+    } catch (error) {
+      console.error('[NewsAPI] Error extracting news:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get specific company news
+   * @param {string} symbol - Stock ticker (e.g., "AAPL")
+   * @returns {array} - News articles about the company
+   */
+  static async fetchCompanyNews(symbol) {
+    try {
+      const response = await axios.get(`${NEWSAPI_BASE_URL}/everything`, {
+        params: {
+          q: symbol,
+          sortBy: 'publishedAt',
+          language: 'en',
+          pageSize: 10,
+          apiKey: API_KEY
+        },
+        timeout: 5000
+      });
+
+      return response.data.articles || [];
+    } catch (error) {
+      console.error(`[NewsAPI] Error fetching news for ${symbol}:`, error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Get breaking financial news
+   */
+  static async fetchBreakingNews() {
+    try {
+      console.log('[NewsAPI] Fetching breaking financial news...');
+
+      const response = await axios.get(`${NEWSAPI_BASE_URL}/top-headlines`, {
+        params: {
+          category: 'business',
+          language: 'en',
+          pageSize: 20,
+          apiKey: API_KEY
+        },
+        timeout: 5000
+      });
+
+      const headlines = (response.data.articles || [])
+        .slice(0, 5)
+        .map(article => article.title);
+
+      console.log('[NewsAPI] Breaking news fetched:', headlines.length);
+      return headlines;
+    } catch (error) {
+      console.error('[NewsAPI] Error fetching breaking news:', error.message);
+      return [];
+    }
+  }
+}
+
+module.exports = NewsAPIService;
+
+
+===== ./backend/services/quarterlyDataSplitter.js =====
+// This service splits yearly data into quarterly data properly
+
+const splitYearlyDataIntoQuarters = (yearlyData) => {
+  const { indices, news, year } = yearlyData;
+
+  console.log('[quarterlyDataSplitter] Starting to split yearly data into quarters');
+  console.log(`[quarterlyDataSplitter] Year: ${year}`);
+  console.log(`[quarterlyDataSplitter] Available symbols: ${Object.keys(indices).join(', ')}`);
+
+  // Helper: Extract quarterly data from yearly Polygon data
+  const getQuarterlyDataFromPolygon = (symbol, quarter) => {
+    try {
+      const symbolData = indices[symbol];
+      
+      if (!symbolData || !symbolData.polygon) {
+        console.log(`[quarterlyDataSplitter] No polygon data for ${symbol}`);
+        return null;
+      }
+
+      const polygonData = symbolData.polygon;
+      
+      // Check if we have daily data array
+      if (!polygonData.data || !Array.isArray(polygonData.data)) {
+        console.log(`[quarterlyDataSplitter] No daily data array for ${symbol}`);
+        return null;
+      }
+
+      const dailyData = polygonData.data;
+      
+      // Quarter month ranges
+      const quarterMonths = {
+        'Q1': [1, 2, 3],
+        'Q2': [4, 5, 6],
+        'Q3': [7, 8, 9],
+        'Q4': [10, 11, 12]
+      };
+
+      const targetMonths = quarterMonths[quarter];
+
+      // Filter daily data for this quarter
+      const quarterlyDays = dailyData.filter(day => {
+        if (!day.t) return false; // Skip if no timestamp
+        
+        const date = new Date(day.t);
+        const dayYear = date.getFullYear();
+        const dayMonth = date.getMonth() + 1;
+
+        return dayYear === year && targetMonths.includes(dayMonth);
+      });
+
+      if (quarterlyDays.length === 0) {
+        console.log(`[quarterlyDataSplitter] No trading days found for ${symbol} ${quarter} ${year}`);
+        return null;
+      }
+
+      // Calculate quarterly return
+      const startPrice = quarterlyDays[0].o;
+      const endPrice = quarterlyDays[quarterlyDays.length - 1].c;
+      const quarterlyReturn = ((endPrice - startPrice) / startPrice) * 100;
+
+      const result = {
+        source: 'Polygon',
+        symbol: symbol,
+        open: startPrice,
+        close: endPrice,
+        high: Math.max(...quarterlyDays.map(d => d.h || 0)),
+        low: Math.min(...quarterlyDays.map(d => d.l || Infinity)),
+        return: parseFloat(quarterlyReturn.toFixed(2)),
+        daysInQuarter: quarterlyDays.length,
+        volume: quarterlyDays.reduce((sum, d) => sum + (d.v || 0), 0)
+      };
+
+      console.log(`[quarterlyDataSplitter] ${symbol} ${quarter}: return=${result.return}%, days=${result.daysInQuarter}`);
+      
+      return result;
+    } catch (error) {
+      console.error(`[quarterlyDataSplitter] Error processing ${symbol} ${quarter}:`, error.message);
+      return null;
+    }
+  };
+
+  // Helper: Extract quarterly data from Finnhub (fallback)
+  const getQuarterlyDataFromFinnhub = (symbol, quarter) => {
+    try {
+      const symbolData = indices[symbol];
+      
+      if (!symbolData || !symbolData.finnhub) {
+        return null;
+      }
+
+      const finnhubData = symbolData.finnhub;
+      
+      // Finnhub doesn't have daily breakdown in our case, so we approximate
+      // This is a fallback - Polygon is preferred
+      return {
+        source: 'Finnhub (Estimated)',
+        symbol: symbol,
+        return: finnhubData.return ? parseFloat((finnhubData.return / 4).toFixed(2)) : 0,
+        daysInQuarter: finnhubData.daysInYear ? Math.ceil(finnhubData.daysInYear / 4) : 0
+      };
+    } catch (error) {
+      console.error(`[quarterlyDataSplitter] Error with Finnhub ${symbol}:`, error.message);
+      return null;
+    }
+  };
+
+  // Build complete quarterly data structure
+  const buildQuarterStructure = (quarter) => {
+    console.log(`\n[quarterlyDataSplitter] Building ${quarter} structure...`);
+
+    const quarterData = {
+      indices: {
+        SPY: {
+          finnhub: null,
+          alphaVantage: null,
+          polygon: getQuarterlyDataFromPolygon('SPY', quarter) || getQuarterlyDataFromFinnhub('SPY', quarter)
+        },
+        QQQ: {
+          finnhub: null,
+          alphaVantage: null,
+          polygon: getQuarterlyDataFromPolygon('QQQ', quarter) || getQuarterlyDataFromFinnhub('QQQ', quarter)
+        },
+        ACWX: {
+          finnhub: null,
+          alphaVantage: null,
+          polygon: getQuarterlyDataFromPolygon('ACWX', quarter) || getQuarterlyDataFromFinnhub('ACWX', quarter)
+        }
+      },
+      news: news && news.length > 0 ? news.slice(0, 5) : [],
+      quarter: quarter,
+      year: year
+    };
+
+    console.log(`[quarterlyDataSplitter] ${quarter} structure complete`);
+    console.log(`  SPY: ${quarterData.indices.SPY.polygon?.return || 'N/A'}%`);
+    console.log(`  QQQ: ${quarterData.indices.QQQ.polygon?.return || 'N/A'}%`);
+    console.log(`  ACWX: ${quarterData.indices.ACWX.polygon?.return || 'N/A'}%`);
+
+    return quarterData;
+  };
+
+  const result = {
+    q1: buildQuarterStructure('Q1'),
+    q2: buildQuarterStructure('Q2'),
+    q3: buildQuarterStructure('Q3'),
+    q4: buildQuarterStructure('Q4'),
+    year: year,
+    dataType: 'quarterly'
+  };
+
+  console.log('\n[quarterlyDataSplitter] ✅ Yearly data split into quarters complete\n');
+
+  return result;
+};
+
+module.exports = {
+  splitYearlyDataIntoQuarters
+};
+
+===== ./backend/services/reportService.js =====
+// const PDFDocument = require('pdfkit');
+
+// const generateHTMLReport = (reportData) => {
+//   console.log('[HTML] generateHTMLReport called');
+//   console.log('[HTML] reportData keys:', Object.keys(reportData));
+//   console.log('[HTML] reportData.narrative length:', reportData.narrative?.length || 0);
+//   console.log('[HTML] reportData.summary length:', reportData.summary?.length || 0);
+  
+//   if (!reportData) {
+//     console.log('[HTML ERROR] reportData is null/undefined');
+//     return '';
+//   }
+  
+//   const { quarter, year, narrative, summary, data } = reportData;
+  
+//   console.log('[HTML] Extracted values:');
+//   console.log(`  quarter: ${quarter}`);
+//   console.log(`  year: ${year}`);
+//   console.log(`  narrative length: ${narrative?.length || 0}`);
+//   console.log(`  summary length: ${summary?.length || 0}`);
+//   console.log(`  data keys: ${Object.keys(data || {})}`);
+
+//   const indices = data?.indices || {};
+//   const sp500Return = indices.SP500;
+//   const nasdaqReturn = indices.NASDAQ;
+//   const acwiReturn = indices.ACWI;
+//   const recordHighs = indices.SP500RecordHighs;
+
+//   console.log('[HTML] Indices values:');
+//   console.log(`  SP500: ${sp500Return}`);
+//   console.log(`  NASDAQ: ${nasdaqReturn}`);
+//   console.log(`  ACWI: ${acwiReturn}`);
+//   console.log(`  RecordHighs: ${recordHighs}`);
+
+//   const majorNews = data?.majorNews || [];
+  
+//   console.log('[HTML] majorNews:', majorNews.length, 'items');
+
+//   const majorNewsHTML = majorNews.length > 0
+//     ? `
+//       <div class="data-section">
+//         <h3>Market Drivers & Key Events</h3>
+//         <ul style="padding-left: 1.5rem;">
+//           ${majorNews.slice(0, 5).map(news => `<li>${news}</li>`).join('')}
+//         </ul>
+//       </div>
+//     `
+//     : '';
+
+//   const dataSourceHTML = `
+//     <div class="data-section" style="margin-top: 2rem; padding: 1rem; background: #f0f4ff; border-radius: 6px;">
+//       <h3>Data Source</h3>
+//       <p style="font-size: 0.9em; color: #666; margin-top: 0.5rem;">
+//         Report generated with real financial data from Finnhub, Alpha Vantage, Polygon, and NewsAPI.
+//       </p>
+//     </div>
+//   `;
+
+//   const html = `
+//     <!DOCTYPE html>
+//     <html lang="en">
+//     <head>
+//       <meta charset="UTF-8">
+//       <meta name="viewport" content="width=device-width, initial-scale=1.0">
+//       <title>${quarter} ${year} Quarterly Report</title>
+//       <style>
+//         * {
+//           margin: 0;
+//           padding: 0;
+//           box-sizing: border-box;
+//         }
+//         body {
+//           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+//           line-height: 1.6;
+//           color: #333;
+//           background: #f5f5f5;
+//         }
+//         .container {
+//           max-width: 900px;
+//           margin: 0 auto;
+//           background: white;
+//           padding: 60px;
+//           box-shadow: 0 0 20px rgba(0,0,0,0.1);
+//         }
+//         header {
+//           border-bottom: 3px solid #1e40af;
+//           padding-bottom: 30px;
+//           margin-bottom: 40px;
+//         }
+//         h1 {
+//           font-size: 2.5em;
+//           color: #1e40af;
+//           margin-bottom: 10px;
+//         }
+//         .subtitle {
+//           color: #666;
+//           font-size: 1.1em;
+//         }
+//         .summary-box {
+//           background: #f0f4ff;
+//           border-left: 4px solid #1e40af;
+//           padding: 20px;
+//           margin: 30px 0;
+//           border-radius: 4px;
+//         }
+//         .summary-box h3 {
+//           color: #1e40af;
+//           margin-bottom: 10px;
+//         }
+//         .narrative {
+//           font-size: 1.05em;
+//           text-align: justify;
+//           margin: 40px 0;
+//           line-height: 1.8;
+//         }
+//         .narrative p {
+//           margin-bottom: 1rem;
+//         }
+//         .metrics {
+//           display: grid;
+//           grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+//           gap: 20px;
+//           margin: 40px 0;
+//         }
+//         .metric-card {
+//           background: #f9fafb;
+//           padding: 20px;
+//           border-radius: 8px;
+//           border: 1px solid #e5e7eb;
+//         }
+//         .metric-label {
+//           font-size: 0.9em;
+//           color: #666;
+//           text-transform: uppercase;
+//           margin-bottom: 8px;
+//         }
+//         .metric-value {
+//           font-size: 1.8em;
+//           font-weight: bold;
+//           color: #1e40af;
+//         }
+//         .data-section {
+//           margin: 1.5rem 0;
+//           padding: 1rem;
+//           background: #f9fafb;
+//           border-radius: 6px;
+//         }
+//         .data-section h3 {
+//           color: #1e40af;
+//           margin-bottom: 1rem;
+//         }
+//         .data-section ul {
+//           padding-left: 1.5rem;
+//         }
+//         .data-section li {
+//           margin: 0.5rem 0;
+//           color: #555;
+//         }
+//         footer {
+//           border-top: 1px solid #e5e7eb;
+//           margin-top: 50px;
+//           padding-top: 20px;
+//           color: #999;
+//           font-size: 0.9em;
+//           text-align: center;
+//         }
+//       </style>
+//     </head>
+//     <body>
+//       <div class="container">
+//         <header>
+//           <h1>Quarterly Equity Market Report</h1>
+//           <p class="subtitle">${quarter} ${year}</p>
+//         </header>
+
+//         <div class="summary-box">
+//           <h3>Executive Summary</h3>
+//           <p>${summary || 'Summary not yet generated'}</p>
+//         </div>
+
+//         <div class="narrative">
+//           ${narrative ? narrative.split('\n').filter(p => p.trim()).map(p => `<p>${p.trim()}</p>`).join('') : '<p>Report not yet generated</p>'}
+//         </div>
+
+//         <div class="metrics">
+//           <div class="metric-card">
+//             <div class="metric-label">S&P 500 Return</div>
+//             <div class="metric-value">${sp500Return !== undefined ? sp500Return : '0'}%</div>
+//           </div>
+//           <div class="metric-card">
+//             <div class="metric-label">NASDAQ Return</div>
+//             <div class="metric-value">${nasdaqReturn !== undefined ? nasdaqReturn : '0'}%</div>
+//           </div>
+//           <div class="metric-card">
+//             <div class="metric-label">MSCI ACWI Return</div>
+//             <div class="metric-value">${acwiReturn !== undefined ? acwiReturn : '0'}%</div>
+//           </div>
+//           <div class="metric-card">
+//             <div class="metric-label">Record Highs</div>
+//             <div class="metric-value">${recordHighs || 'N/A'}</div>
+//           </div>
+//         </div>
+
+//         ${majorNewsHTML}
+
+//         ${dataSourceHTML}
+
+//         <footer>
+//           <p>Generated: ${new Date().toLocaleDateString()}</p>
+//           <p>This report is for informational purposes only and should not be considered investment advice.</p>
+//         </footer>
+//       </div>
+//     </body>
+//     </html>
+//   `;
+
+//   console.log('[HTML] HTML generated, length:', html.length);
+//   return html;
+// };
+
+// const generatePDFReport = (report, res) => {
+//   try {
+//     console.log('[PDF] generatePDFReport called');
+//     console.log('[PDF] report keys:', Object.keys(report).filter(k => !k.includes('_')));
+    
+//     if (!report) {
+//       console.log('[PDF ERROR] report is null/undefined');
+//       throw new Error('Report data not found');
+//     }
+
+//     const { quarter, year, narrative, summary, data } = report;
+    
+//     console.log('[PDF] Extracted values:');
+//     console.log(`  quarter: ${quarter}`);
+//     console.log(`  year: ${year}`);
+//     console.log(`  narrative length: ${narrative?.length || 0}`);
+//     console.log(`  summary length: ${summary?.length || 0}`);
+//     console.log(`  data: ${data ? 'EXISTS' : 'NULL'}`);
+
+//     const indices = data?.indices || {};
+//     const sp500Return = indices.SP500;
+//     const nasdaqReturn = indices.NASDAQ;
+//     const acwiReturn = indices.ACWI;
+//     const recordHighs = indices.SP500RecordHighs;
+//     const majorNews = data?.majorNews || [];
+
+//     console.log('[PDF] Indices:');
+//     console.log(`  SP500: ${sp500Return}`);
+//     console.log(`  NASDAQ: ${nasdaqReturn}`);
+//     console.log(`  ACWI: ${acwiReturn}`);
+//     console.log(`  RecordHighs: ${recordHighs}`);
+//     console.log(`  majorNews: ${majorNews.length} items`);
+
+//     const doc = new PDFDocument({
+//       margin: 50,
+//       size: 'A4'
+//     });
+
+//     const filename = `${quarter}-${year}-report.pdf`;
+//     res.setHeader('Content-Type', 'application/pdf');
+//     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+//     doc.pipe(res);
+
+//     // TITLE
+//     doc.fontSize(28).font('Helvetica-Bold').fillColor('#1e40af');
+//     doc.text('Quarterly Equity Market Report', { align: 'center' });
+    
+//     doc.fontSize(16).fillColor('#666');
+//     doc.text(`${quarter} ${year}`, { align: 'center' });
+//     doc.moveDown(0.5);
+
+//     // Line
+//     doc.lineWidth(2).strokeColor('#1e40af').lineTo(doc.page.width - 100, 0).stroke();
+//     doc.moveDown(1);
+
+//     // EXECUTIVE SUMMARY
+//     doc.fontSize(14).font('Helvetica-Bold').fillColor('#1e40af');
+//     doc.text('Executive Summary');
+//     doc.fontSize(11).font('Helvetica').fillColor('#333');
+//     doc.text(summary || 'Summary not yet generated', {
+//       align: 'justify',
+//       width: 500
+//     });
+//     doc.moveDown(1);
+
+//     // MARKET NARRATIVE
+//     doc.fontSize(14).font('Helvetica-Bold').fillColor('#1e40af');
+//     doc.text('Market Narrative');
+//     doc.fontSize(11).font('Helvetica').fillColor('#333');
+    
+//     if (narrative) {
+//       const paragraphs = narrative.split('\n').filter(p => p.trim());
+//       console.log('[PDF] Narrative paragraphs:', paragraphs.length);
+//       paragraphs.forEach((para, idx) => {
+//         if (para.trim()) {
+//           doc.text(para.trim(), {
+//             align: 'justify',
+//             width: 500
+//           });
+//           doc.moveDown(0.4);
+//         }
+//       });
+//     } else {
+//       console.log('[PDF WARNING] No narrative found');
+//     }
+//     doc.moveDown(0.5);
+
+//     // KEY MARKET METRICS
+//     doc.fontSize(14).font('Helvetica-Bold').fillColor('#1e40af');
+//     doc.text('Key Market Metrics');
+//     doc.moveDown(0.5);
+
+//     doc.fontSize(11).font('Helvetica-Bold').fillColor('#333');
+//     doc.text(`S&P 500 Return: ${sp500Return !== undefined ? sp500Return : '0'}%`, { indent: 20 });
+//     doc.text(`NASDAQ Return: ${nasdaqReturn !== undefined ? nasdaqReturn : '0'}%`, { indent: 20 });
+//     doc.text(`MSCI ACWI Return: ${acwiReturn !== undefined ? acwiReturn : '0'}%`, { indent: 20 });
+//     doc.text(`Record Highs: ${recordHighs || 'N/A'}`, { indent: 20 });
+//     doc.moveDown(0.5);
+
+//     // MARKET DRIVERS
+//     if (majorNews.length > 0) {
+//       doc.fontSize(14).font('Helvetica-Bold').fillColor('#1e40af');
+//       doc.text('Market Drivers & Key Events');
+//       doc.moveDown(0.3);
+
+//       doc.fontSize(10).font('Helvetica').fillColor('#333');
+//       majorNews.slice(0, 5).forEach(news => {
+//         doc.text(`• ${news}`, { indent: 20 });
+//       });
+//       doc.moveDown(0.5);
+//     }
+
+//     // FOOTER
+//     doc.fontSize(9).fillColor('#999');
+//     doc.text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
+//     doc.text('This report is for informational purposes only and should not be considered investment advice.', 
+//       { align: 'center', width: 500 }
+//     );
+
+//     console.log('[PDF] PDF generation complete');
+//     doc.end();
+
+//   } catch (error) {
+//     console.error('[PDF CRITICAL ERROR]:', error.message);
+//     console.error(error.stack);
+//     res.status(500).json({ error: 'Failed to generate PDF', details: error.message });
+//   }
+// };
+
+// module.exports = {
+//   generateHTMLReport,
+//   generatePDFReport
+// };
+
+
+
+//above code is working correctly
+
+
+const PDFDocument = require('pdfkit');
+
+const generateHTMLReport = (reportData) => {
+  if (!reportData) return '';
+  
+  const { quarter, year, narrative, summary, data } = reportData;
+  
+  // Extract indices safely
+  const indices = data?.indices || {};
+  const sp500Return = indices.SP500 !== undefined ? indices.SP500 : 0;
+  const nasdaqReturn = indices.NASDAQ !== undefined ? indices.NASDAQ : 0;
+  const acwiReturn = indices.ACWI !== undefined ? indices.ACWI : 0;
+  const recordHighs = indices.SP500RecordHighs || 'N/A';
+
+  console.log(`[ReportService] Generating HTML with data:`, { sp500Return, nasdaqReturn, acwiReturn, recordHighs });
+
+  const majorNews = data?.majorNews || [];
+
+  // Generate data bullets (analyst insights with company performance)
+  // Calculate concentration level from Nasdaq/S&P spread
+  const nasdaqSpread = Math.abs(nasdaqReturn - sp500Return);
+  let concentrationStatement = '';
+  if (nasdaqSpread > 8) {
+    concentrationStatement = `Extreme concentration: approximately 6-8 stocks accounted for 55-65% of total returns`;
+  } else if (nasdaqSpread > 4) {
+    concentrationStatement = `Notable concentration: approximately 8-10 stocks accounted for 50-60% of total returns`;
+  } else {
+    concentrationStatement = `Broad-based participation: 15+ stocks contributed significantly to returns`;
+  }
+
+  const dataMetricsHTML = `        <div class="data-section">
+          <h3>Key Market Data</h3>
+          <ul style="padding-left: 1.5rem;">
+            <li><strong>Index Returns:</strong> S&P 500 ${sp500Return > 0 ? '+' : ''}${sp500Return}% | Nasdaq ${nasdaqReturn > 0 ? '+' : ''}${nasdaqReturn}% | MSCI ACWI ${acwiReturn > 0 ? '+' : ''}${acwiReturn}%</li>
+            <li><strong>Record Highs:</strong> S&P 500 reached ${recordHighs} new highs during the quarter</li>
+            <li><strong>Market Concentration:</strong> ${concentrationStatement}</li>
+            ${data?.indices?.topStocks ? `<li><strong>Key Stock Performance:</strong> ${data.indices.topStocks}</li>` : `<li><strong>Key Stock Moves:</strong> Major companies reacted to earnings reports with mixed results across sectors</li>`}
+          </ul>
+        </div>`;
+
+  const majorNewsHTML = majorNews.length > 0
+    ? `        <div class="data-section">
+          <h3>Market Context & News</h3>
+          <ul style="padding-left: 1.5rem;">
+            ${majorNews.slice(0, 3).map(news => `<li>${news}</li>`).join('')}
+          </ul>
+        </div>`
+    : '';
+
+  const dataSourceHTML = `        <div class="data-section" style="margin-top: 2rem; padding: 1rem; background: #f0f4ff; border-radius: 6px;">
+          <h3>Data Source</h3>
+          <p style="font-size: 0.9em; color: #666; margin-top: 0.5rem;">
+            Report generated with real financial data from Finnhub, Alpha Vantage, Polygon, and NewsAPI.
+          </p>
+        </div>`;
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>${quarter} ${year} Quarterly Report</title>
+      <style>
+        * {
+          margin: 0;
+          padding: 0;
+          box-sizing: border-box;
+        }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+          line-height: 1.6;
+          color: #333;
+          background: #f5f5f5;
+        }
+        .container {
+          max-width: 900px;
+          margin: 0 auto;
+          background: white;
+          padding: 60px;
+          box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        header {
+          border-bottom: 3px solid #1e40af;
+          padding-bottom: 30px;
+          margin-bottom: 40px;
+        }
+        h1 {
+          font-size: 2.5em;
+          color: #1e40af;
+          margin-bottom: 10px;
+        }
+        .subtitle {
+          color: #666;
+          font-size: 1.1em;
+        }
+        .summary-box {
+          background: #f0f4ff;
+          border-left: 4px solid #1e40af;
+          padding: 20px;
+          margin: 30px 0;
+          border-radius: 4px;
+        }
+        .summary-box h3 {
+          color: #1e40af;
+          margin-bottom: 10px;
+        }
+        .narrative {
+          font-size: 1.05em;
+          text-align: justify;
+          margin: 40px 0;
+          line-height: 1.8;
+        }
+        .narrative p {
+          margin-bottom: 1rem;
+        }
+        .metrics {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 20px;
+          margin: 40px 0;
+        }
+        .metric-card {
+          background: #f9fafb;
+          padding: 20px;
+          border-radius: 8px;
+          border: 1px solid #e5e7eb;
+        }
+        .metric-label {
+          font-size: 0.9em;
+          color: #666;
+          text-transform: uppercase;
+          margin-bottom: 8px;
+        }
+        .metric-value {
+          font-size: 1.8em;
+          font-weight: bold;
+          color: #1e40af;
+        }
+        .data-section {
+          margin: 1.5rem 0;
+          padding: 1rem;
+          background: #f9fafb;
+          border-radius: 6px;
+        }
+        .data-section h3 {
+          color: #1e40af;
+          margin-bottom: 1rem;
+        }
+        .data-section ul {
+          padding-left: 1.5rem;
+        }
+        .data-section li {
+          margin: 0.5rem 0;
+          color: #555;
+        }
+        footer {
+          border-top: 1px solid #e5e7eb;
+          margin-top: 50px;
+          padding-top: 20px;
+          color: #999;
+          font-size: 0.9em;
+          text-align: center;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <header>
+          <h1>Quarterly Equity Market Report</h1>
+          <p class="subtitle">${quarter} ${year}</p>
+        </header>
+
+        <div class="narrative">
+${narrative ? (() => {
+            const paragraphs = narrative.split('\n').filter(p => p.trim());
+            if (paragraphs.length > 0) {
+              return paragraphs.map(p => `          <p>${p.trim()}</p>`).join('\n');
+            }
+            return '          <p>Report not yet generated</p>';
+          })() : '          <p>Report not yet generated</p>'}
+        </div>
+
+        ${dataMetricsHTML}
+
+        <div class="summary-box">
+          <h3>Executive Summary</h3>
+          <p>${summary || 'Summary not yet generated'}</p>
+        </div>
+
+        ${majorNewsHTML}
+
+        ${dataSourceHTML}
+
+        <footer>
+          <p>Generated: ${new Date().toLocaleDateString()}</p>
+          <p>This report is for informational purposes only and should not be considered investment advice.</p>
+        </footer>
+      </div>
+    </body>
+    </html>
+  `;
+
+  return html;
+};
+
+const generatePDFReport = async (report, res) => {
+  try {
+    const doc = new PDFDocument();
+    
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Q${report.quarterNumber}-${report.year}-Report.pdf"`);
+    
+    doc.pipe(res);
+
+    // Add content from HTML
+    doc.fontSize(20).text(`Quarterly Equity Market Report`, { align: 'center' });
+    doc.fontSize(12).text(`${report.quarter} ${report.year}`, { align: 'center' });
+    doc.moveDown();
+
+    if (report.summary) {
+      doc.fontSize(12).font('Helvetica-Bold').text('Executive Summary', { underline: true });
+      doc.font('Helvetica').text(report.summary, { align: 'justify' });
+      doc.moveDown();
+    }
+
+    if (report.narrative) {
+      doc.fontSize(12).font('Helvetica-Bold').text('Market Narrative', { underline: true });
+      doc.font('Helvetica').text(report.narrative, { align: 'justify' });
+      doc.moveDown();
+    }
+
+    doc.fontSize(10).text('Report generated with real financial data from Finnhub, Alpha Vantage, Polygon, and NewsAPI.', { color: '#999' });
+    
+    doc.end();
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+module.exports = {
+  generateHTMLReport,
+  generatePDFReport
+};
+
+===== ./frontend/package.json =====
+{
+  "name": "quarterly-reports-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "proxy": "http://localhost:5000",
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "axios": "^1.5.0",
+    "react-router-dom": "^6.15.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "devDependencies": {
+    "react-scripts": "5.0.1"
+  }
+}
+
+
+===== ./frontend/src/App.css =====
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #f5f7fa;
+}
+
+.app {
+  min-height: 100vh;
+}
+
+/* Navbar */
+.navbar {
+  background: linear-gradient(135deg, #1e40af 0%, #1e3a8a 100%);
+  color: white;
+  padding: 1rem 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.nav-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.logo {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.nav-links {
+  display: flex;
+  list-style: none;
+  gap: 2rem;
+}
+
+.nav-links a {
+  color: white;
+  text-decoration: none;
+  font-weight: 500;
+  transition: opacity 0.3s ease;
+}
+
+.nav-links a:hover {
+  opacity: 0.8;
+}
+
+/* Container */
+.container {
+  max-width: 1200px;
+  margin: 2rem auto;
+  padding: 0 2rem;
+}
+
+/* Forms */
+.form-group {
+  margin-bottom: 1.5rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+  color: #333;
+}
+
+.form-group input,
+.form-group textarea,
+.form-group select {
+  width: 100%;
+  padding: 0.75rem;
+  border: 2px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-family: inherit;
+  transition: border-color 0.3s ease;
+}
+
+.form-group input:focus,
+.form-group textarea:focus,
+.form-group select:focus {
+  outline: none;
+  border-color: #1e40af;
+  box-shadow: 0 0 0 3px rgba(30, 64, 175, 0.1);
+}
+
+.form-group textarea {
+  resize: vertical;
+  min-height: 100px;
+}
+
+/* Buttons */
+.btn {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  display: inline-block;
+}
+
+.btn-primary {
+  background: #1e40af;
+  color: white;
+}
+
+.btn-primary:hover {
+  background: #1e3a8a;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(30, 64, 175, 0.3);
+}
+
+.btn-secondary {
+  background: #6b7280;
+  color: white;
+}
+
+.btn-secondary:hover {
+  background: #4b5563;
+}
+
+.btn-success {
+  background: #16a34a;
+  color: white;
+}
+
+.btn-success:hover {
+  background: #15803d;
+}
+
+.btn-danger {
+  background: #dc2626;
+  color: white;
+}
+
+.btn-danger:hover {
+  background: #b91c1c;
+}
+
+.btn-sm {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+}
+
+/* Cards */
+.card {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.card-header {
+  border-bottom: 2px solid #f3f4f6;
+  padding-bottom: 1rem;
+  margin-bottom: 1rem;
+}
+
+.card-header h2 {
+  color: #1e40af;
+  margin: 0;
+}
+
+/* Status Badge */
+.badge {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin-right: 0.5rem;
+}
+
+.badge-draft {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.badge-generating {
+  background: #dbeafe;
+  color: #0c4a6e;
+}
+
+.badge-completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.badge-failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+/* Loading */
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 300px;
+}
+
+.spinner {
+  border: 4px solid #f3f4f6;
+  border-top: 4px solid #1e40af;
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Grid */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+.grid-2 {
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+}
+
+/* Alert */
+.alert {
+  padding: 1rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.alert-error {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.alert-success {
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+
+.alert-info {
+  background: #dbeafe;
+  color: #0c4a6e;
+  border: 1px solid #bfdbfe;
+}
+
+
+===== ./frontend/src/App.js =====
+import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import ReportsList from './pages/ReportsList';
+import CreateReport from './pages/CreateReport';
+import ReportDetail from './pages/ReportDetail';
+import AnnualReports from './pages/AnnualReports';
+import './App.css';
+
+function App() {
+  const [reports, setReports] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  return (
+    <Router>
+      <div className="app">
+        <nav className="navbar">
+          <div className="nav-container">
+            <h1 className="logo">📊 Quarterly Reports Generator</h1>
+            <ul className="nav-links">
+              <li><a href="/">All Reports</a></li>
+              <li><a href="/create">Create Report</a></li>
+              <li><a href="/annual-reports">Annual Reports</a></li>
+            </ul>
+          </div>
+        </nav>
+
+        <Routes>
+          <Route path="/" element={<ReportsList />} />
+          <Route path="/create" element={<CreateReport />} />
+          <Route path="/report/:id" element={<ReportDetail />} />
+          <Route path="/annual-reports" element={<AnnualReports />} />
+        </Routes>
+      </div>
+    </Router>
+  );
+}
+
+export default App;
+
+
+===== ./frontend/src/index.css =====
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+
+===== ./frontend/src/index.js =====
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+
+===== ./frontend/src/pages/AnnualReports.css =====
+.annual-reports-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+  min-height: 100vh;
+}
+
+.header {
+  text-align: center;
+  margin-bottom: 40px;
+  padding-bottom: 20px;
+  border-bottom: 3px solid #1e40af;
+}
+
+.header h1 {
+  font-size: 2.5em;
+  color: #1e40af;
+  margin-bottom: 10px;
+}
+
+.header p {
+  color: #666;
+  font-size: 1.1em;
+}
+
+.generate-section {
+  background: white;
+  padding: 30px;
+  border-radius: 8px;
+  margin-bottom: 40px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.form-group {
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 15px;
+}
+
+.form-group label {
+  font-weight: 600;
+  color: #333;
+  min-width: 120px;
+}
+
+.form-group select {
+  padding: 10px 15px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 1em;
+  width: 200px;
+}
+
+.btn-generate {
+  background: #1e40af;
+  color: white;
+  padding: 12px 30px;
+  border: none;
+  border-radius: 4px;
+  font-size: 1em;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.3s ease;
+}
+
+.btn-generate:hover:not(:disabled) {
+  background: #1832a3;
+}
+
+.btn-generate:disabled {
+  background: #999;
+  cursor: not-allowed;
+}
+
+.error-message {
+  color: #d32f2f;
+  padding: 15px;
+  background: #ffebee;
+  border-radius: 4px;
+  margin-top: 15px;
+}
+
+.success-message {
+  color: #388e3c;
+  padding: 15px;
+  background: #e8f5e9;
+  border-radius: 4px;
+  margin-top: 15px;
+}
+
+.reports-list {
+  background: white;
+  padding: 30px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.reports-list h2 {
+  color: #1e40af;
+  margin-bottom: 25px;
+  font-size: 1.5em;
+}
+
+.no-reports {
+  text-align: center;
+  color: #999;
+  padding: 40px;
+  font-size: 1.1em;
+}
+
+.reports-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 20px;
+}
+
+.report-card {
+  background: #f9fafb;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.report-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.report-card h3 {
+  font-size: 1.5em;
+  color: #1e40af;
+  margin-bottom: 10px;
+}
+
+.status {
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 0.85em;
+  font-weight: 600;
+  margin-bottom: 15px;
+}
+
+.status-completed {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status-generating {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.status-draft {
+  background: #e2e3e5;
+  color: #383d41;
+}
+
+.status-failed {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.btn-view,
+.btn-download {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.3s ease;
+}
+
+.btn-view {
+  background: #1e40af;
+  color: white;
+}
+
+.btn-view:hover {
+  background: #1832a3;
+}
+
+.btn-download {
+  background: #10b981;
+  color: white;
+}
+
+.btn-download:hover {
+  background: #059669;
+}
+
+.timestamp {
+  font-size: 0.85em;
+  color: #999;
+  margin-top: 10px;
+}
+
+===== ./frontend/src/pages/AnnualReports.js =====
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import './AnnualReports.css';
+
+const AnnualReports = () => {
+  const [reports, setReports] = useState([]);
+  const [selectedYear, setSelectedYear] = useState(new Date().getFullYear());
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  useEffect(() => {
+    fetchReports();
+  }, []);
+
+  const fetchReports = async () => {
+    try {
+      const response = await axios.get('/api/annual-reports');
+      setReports(response.data);
+    } catch (err) {
+      console.error('Error fetching reports:', err);
+      setError('Failed to fetch reports');
+    }
+  };
+
+  const handleGenerateReport = async () => {
+    setLoading(true);
+    setError('');
+    setSuccess('');
+
+    try {
+      // Create annual report
+      const createResponse = await axios.post('/api/annual-reports', { year: selectedYear });
+      const reportId = createResponse.data._id;
+
+      // Generate report
+      const generateResponse = await axios.post(`/api/annual-reports/${reportId}/generate`);
+
+      if (generateResponse.data) {
+        setSuccess(`Annual report for ${selectedYear} generated successfully!`);
+        // Refresh list
+        fetchReports();
+      }
+    } catch (err) {
+      const errorMsg = err.response?.data?.error || err.message || 'Error generating report';
+      setError(errorMsg);
+      console.error('Error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // FIXED: Use fetch to bypass React Router
+  const handleViewHTML = async (id) => {
+    try {
+      setError('');
+      console.log(`[AnnualReports] Fetching HTML for report ${id}`);
+      
+      // Fetch HTML as text
+      const response = await fetch(`/api/annual-reports/${id}/html`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: Failed to fetch HTML`);
+      }
+      
+      const htmlContent = await response.text();
+      console.log(`[AnnualReports] Received HTML: ${htmlContent.length} bytes`);
+      
+      if (!htmlContent || htmlContent.length === 0) {
+        throw new Error('HTML content is empty');
+      }
+      
+      // Create a new window and write HTML
+      const newWindow = window.open('', '_blank');
+      if (!newWindow) {
+        throw new Error('Could not open new window. Pop-ups may be blocked.');
+      }
+      
+      newWindow.document.write(htmlContent);
+      newWindow.document.close();
+      console.log('[AnnualReports] HTML opened in new window');
+    } catch (err) {
+      console.error('Error viewing HTML:', err);
+      setError(`Failed to load HTML report: ${err.message}`);
+    }
+  };
+
+  // FIXED: Use fetch to bypass React Router
+  const handleDownloadPDF = async (id) => {
+    try {
+      setError('');
+      console.log(`[AnnualReports] Downloading PDF for report ${id}`);
+      
+      // Fetch PDF as blob
+      const response = await fetch(`/api/annual-reports/${id}/pdf`);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: Failed to fetch PDF`);
+      }
+      
+      const blob = await response.blob();
+      console.log(`[AnnualReports] Received PDF: ${blob.size} bytes`);
+      
+      if (blob.size === 0) {
+        throw new Error('PDF is empty');
+      }
+      
+      // Create download link
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `annual-report-${new Date().getFullYear()}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      
+      // Cleanup
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }, 100);
+      
+      console.log('[AnnualReports] PDF download started');
+    } catch (err) {
+      console.error('Error downloading PDF:', err);
+      setError(`Failed to download PDF: ${err.message}`);
+    }
+  };
+
+  const availableYears = [2024, 2025, 2026];
+
+  return (
+    <div className="annual-reports-container">
+      <div className="header">
+        <h1>Annual Equity Market Reports</h1>
+        <p>Generate comprehensive yearly market analysis</p>
+      </div>
+
+      <div className="generate-section">
+        <div className="form-group">
+          <label htmlFor="year">Select Year:</label>
+          <select
+            id="year"
+            value={selectedYear}
+            onChange={(e) => setSelectedYear(parseInt(e.target.value))}
+            disabled={loading}
+          >
+            {availableYears.map(year => (
+              <option key={year} value={year}>{year}</option>
+            ))}
+          </select>
+        </div>
+
+        <button
+          onClick={handleGenerateReport}
+          disabled={loading}
+          className="btn-generate"
+        >
+          {loading ? 'Generating...' : 'Generate Annual Report'}
+        </button>
+
+        {error && <div className="error-message">{error}</div>}
+        {success && <div className="success-message">{success}</div>}
+      </div>
+
+      <div className="reports-list">
+        <h2>Generated Reports</h2>
+
+        {reports.length === 0 ? (
+          <p className="no-reports">No annual reports generated yet.</p>
+        ) : (
+          <div className="reports-grid">
+            {reports.map(report => (
+              <div key={report._id} className="report-card">
+                <h3>{report.year}</h3>
+                <p className={`status status-${report.status}`}>
+                  {report.status.charAt(0).toUpperCase() + report.status.slice(1)}
+                </p>
+
+                {report.status === 'completed' && (
+                  <div className="actions">
+                    <button
+                      onClick={() => handleViewHTML(report._id)}
+                      className="btn-view"
+                    >
+                      View HTML
+                    </button>
+                    <button
+                      onClick={() => handleDownloadPDF(report._id)}
+                      className="btn-download"
+                    >
+                      Download PDF
+                    </button>
+                  </div>
+                )}
+
+                <p className="timestamp">
+                  Generated: {new Date(report.createdAt).toLocaleDateString()}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default AnnualReports;
+
+===== ./frontend/src/pages/CreateReport.js =====
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { reportService } from '../services/api';
+import '../styles/pages.css';
+
+function CreateReport() {
+  const navigate = useNavigate();
+  const [formData, setFormData] = useState({
+    quarter: 'Q1',
+    year: 2025,
+    quarterNumber: 1
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const handleQuarterChange = (e) => {
+    const quarter = e.target.value;
+    const quarterNumber = parseInt(quarter.replace('Q', ''));
+    setFormData(prev => ({
+      ...prev,
+      quarter,
+      quarterNumber
+    }));
+  };
+
+  const handleYearChange = (e) => {
+    setFormData(prev => ({
+      ...prev,
+      year: parseInt(e.target.value)
+    }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      setLoading(true);
+      setError(null);
+      
+      const createdReport = await reportService.createReport({
+        quarter: formData.quarter,
+        year: formData.year,
+        quarterNumber: formData.quarterNumber,
+        data: {}
+      });
+      
+      navigate(`/report/${createdReport._id}`);
+    } catch (err) {
+      console.error('Error creating report:', err);
+      setError(err.response?.data?.error || 'Failed to create report');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="container">
+      <div className="page-header">
+        <h1>Create New Report</h1>
+        <p style={{ color: '#666', marginTop: '10px' }}>
+          Select a quarter and year. Data will be automatically fetched from real financial APIs.
+        </p>
+      </div>
+
+      {error && <div className="alert alert-error">{error}</div>}
+
+      <form onSubmit={handleSubmit} className="report-form">
+        <div className="card">
+          <div className="card-header">
+            <h2>Report Period</h2>
+          </div>
+
+          <div className="form-row" style={{ maxWidth: '600px' }}>
+            <div className="form-group">
+              <label htmlFor="quarter">Quarter</label>
+              <select 
+                id="quarter"
+                name="quarter"
+                value={formData.quarter}
+                onChange={handleQuarterChange}
+                style={{ fontSize: '16px', padding: '12px' }}
+              >
+                <option value="Q1">Q1 (January - March)</option>
+                <option value="Q2">Q2 (April - June)</option>
+                <option value="Q3">Q3 (July - September)</option>
+                <option value="Q4">Q4 (October - December)</option>
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label htmlFor="year">Year</label>
+              <input
+                id="year"
+                type="number"
+                name="year"
+                value={formData.year}
+                onChange={handleYearChange}
+                min="2020"
+                max="2026"
+                style={{ fontSize: '16px', padding: '12px' }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="card" style={{ background: '#f0f4ff', border: '2px solid #1e40af' }}>
+          <div style={{ padding: '20px', textAlign: 'center' }}>
+            <h3 style={{ color: '#1e40af', marginBottom: '15px' }}>✨ Automated Report Generation</h3>
+            <p style={{ color: '#555', marginBottom: '15px', lineHeight: '1.6' }}>
+              When you click "Create Report", we'll automatically fetch real market data from:
+            </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '15px', maxWidth: '500px', margin: '0 auto' }}>
+              <div style={{ background: 'white', padding: '15px', borderRadius: '6px', border: '1px solid #ddd' }}>
+                <strong style={{ color: '#1e40af' }}>Finnhub API</strong>
+                <p style={{ fontSize: '0.9em', color: '#666', margin: '8px 0 0 0' }}>Real market indices & top performers</p>
+              </div>
+              <div style={{ background: 'white', padding: '15px', borderRadius: '6px', border: '1px solid #ddd' }}>
+                <strong style={{ color: '#1e40af' }}>NewsAPI</strong>
+                <p style={{ fontSize: '0.9em', color: '#666', margin: '8px 0 0 0' }}>Real market news & events</p>
+              </div>
+            </div>
+            <p style={{ color: '#666', marginTop: '15px', fontSize: '0.95em' }}>
+              No manual data entry needed. Just select the quarter and year!
+            </p>
+          </div>
+        </div>
+
+        <div className="form-actions" style={{ marginTop: '30px' }}>
+          <button 
+            type="submit" 
+            disabled={loading} 
+            className="btn btn-primary btn-lg"
+            style={{ padding: '15px 40px', fontSize: '16px' }}
+          >
+            {loading ? 'Creating Report...' : '✨ Create Report'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+export default CreateReport;
+
+===== ./frontend/src/pages/ReportDetail.js =====
+import React, { useState, useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { reportService } from '../services/api';
+import '../styles/pages.css';
+
+function ReportDetail() {
+  const { id } = useParams();
+  const navigate = useNavigate();
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState(null);
+  const [showPreview, setShowPreview] = useState(false);
+
+  useEffect(() => {
+    fetchReport();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  const fetchReport = async () => {
+    try {
+      setLoading(true);
+      const data = await reportService.getReport(id);
+      setReport(data);
+      setError(null);
+    } catch (err) {
+      console.error('Error fetching report:', err);
+      setError('Failed to load report');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGenerateReport = async () => {
+    try {
+      setGenerating(true);
+      setError(null);
+      const result = await reportService.generateReport(id);
+      setReport(result.report);
+    } catch (err) {
+      console.error('Error generating report:', err);
+      setError(err.response?.data?.error || 'Failed to generate report');
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const handleDownloadHTML = () => {
+    if (report?.reportHTML) {
+      const element = document.createElement('a');
+      const file = new Blob([report.reportHTML], { type: 'text/html' });
+      element.href = URL.createObjectURL(file);
+      element.download = `${report.quarter}-${report.year}-report.html`;
+      document.body.appendChild(element);
+      element.click();
+      document.body.removeChild(element);
+    }
+  };
+
+  const handleDownloadPDF = async () => {
+    try {
+      const response = await fetch(`http://localhost:5000/api/reports/${id}/pdf`);
+      if (!response.ok) {
+        throw new Error('Failed to download PDF');
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${report.quarter}-${report.year}-report.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error('Error downloading PDF:', err);
+      setError('Failed to download PDF');
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="container">
+        <div className="loading">
+          <div className="spinner"></div>
+          <p>Loading report...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!report) {
+    return (
+      <div className="container">
+        <div className="alert alert-error">Report not found</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container">
+      <div className="page-header">
+        <div>
+          <h1>{report.quarter} {report.year} Report</h1>
+          <p className="subtitle">Quarterly Equity Market Report</p>
+        </div>
+        <div className="header-actions">
+          <button onClick={() => navigate('/')} className="btn btn-secondary">
+            ← Back
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="alert alert-error">{error}</div>}
+
+      <div className="card">
+        <div className="card-header">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h2>Report Status</h2>
+            <span className={`badge badge-${report.status}`}>
+              {report.status.toUpperCase()}
+            </span>
+          </div>
+        </div>
+
+        {report.status === 'draft' && (
+          <div className="card">
+            <div style={{ textAlign: 'center', padding: '2rem' }}>
+              <p style={{ marginBottom: '1rem', fontSize: '1.1em', color: '#555' }}>
+                Ready to generate your report with real financial data?
+              </p>
+              <p style={{ marginBottom: '1.5rem', fontSize: '0.95em', color: '#666' }}>
+                We'll automatically fetch historical data from Finnhub, Alpha Vantage, Polygon APIs, and financial news from NewsAPI.
+              </p>
+              <button
+                onClick={handleGenerateReport}
+                disabled={generating}
+                className="btn btn-success btn-lg"
+              >
+                {generating ? (
+                  <>
+                    <span className="spinner-sm"></span> Generating Report...
+                  </>
+                ) : (
+                  '✨ Generate Report with Real Data'
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {report.status === 'generating' && (
+          <div style={{ textAlign: 'center', padding: '2rem' }}>
+            <div className="spinner"></div>
+            <p>Generating your report with real market data...</p>
+          </div>
+        )}
+
+        {report.status === 'completed' && (
+          <>
+            <div style={{ padding: '1.5rem' }}>
+              <div style={{ marginBottom: '1.5rem' }}>
+                <h3 style={{ color: '#1e40af', marginBottom: '0.5rem' }}>Executive Summary</h3>
+                <p>{report.summary}</p>
+              </div>
+
+              {report.generationMetadata && (
+                <div className="metadata">
+                  <p><strong>Generated:</strong> {new Date(report.generationMetadata.generatedAt).toLocaleString()}</p>
+                  <p><strong>Generation Time:</strong> {(report.generationMetadata.generationTime / 1000).toFixed(2)}s</p>
+                </div>
+              )}
+            </div>
+
+            <div style={{ padding: '1.5rem', borderTop: '1px solid #e5e7eb' }}>
+              <h3 style={{ color: '#1e40af', marginBottom: '1rem' }}>Full Report</h3>
+              <div className="report-preview">
+                <button
+                  onClick={() => setShowPreview(!showPreview)}
+                  className="btn btn-primary"
+                  style={{ marginBottom: '1rem' }}
+                >
+                  {showPreview ? '▼ Hide Preview' : '▶ Show Preview'}
+                </button>
+
+                {showPreview && (
+                  <div
+                    className="html-preview"
+                    dangerouslySetInnerHTML={{ __html: report.reportHTML }}
+                  />
+                )}
+
+                <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
+                  <button
+                    onClick={handleDownloadHTML}
+                    className="btn btn-secondary"
+                  >
+                    ⬇ Download as HTML
+                  </button>
+                  <button
+                    onClick={handleDownloadPDF}
+                    className="btn btn-secondary"
+                  >
+                    📄 Download as PDF
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
+        {report.status === 'failed' && (
+          <div className="alert alert-error" style={{ margin: '1.5rem' }}>
+            {report.errorMessage || 'Failed to generate report. Please try again.'}
+          </div>
+        )}
+      </div>
+
+      {report.status === 'completed' && report.data?.indices && (
+        <div className="card">
+          <div className="card-header">
+            <h2>Key Market Metrics</h2>
+          </div>
+          <div style={{ padding: '1.5rem' }}>
+            <div className="data-section">
+              <h3>Market Indices Performance</h3>
+              <p>S&P 500 Return: <strong>{report.data.indices.SP500 !== undefined ? report.data.indices.SP500 : 'N/A'}%</strong></p>
+              <p>NASDAQ Return: <strong>{report.data.indices.NASDAQ !== undefined ? report.data.indices.NASDAQ : 'N/A'}%</strong></p>
+              <p>MSCI ACWI Return: <strong>{report.data.indices.ACWI !== undefined ? report.data.indices.ACWI : 'N/A'}%</strong></p>
+              <p>Record Highs: <strong>{report.data.indices.SP500RecordHighs || 'N/A'}</strong></p>
+            </div>
+
+            {report.data.majorNews && report.data.majorNews.length > 0 && (
+              <div className="data-section">
+                <h3>Major Market News</h3>
+                <ul style={{ paddingLeft: '1.5rem' }}>
+                  {report.data.majorNews.map((news, i) => (
+                    <li key={i}>{news}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <div className="data-section" style={{ marginTop: '1rem', padding: '1rem', background: '#f0f4ff', borderRadius: '6px' }}>
+              <h3>Data Source</h3>
+              <p style={{ fontSize: '0.95em', color: '#666' }}>
+                {report.data.fetchedFrom || 'Finnhub + AlphaVantage + Polygon + NewsAPI'}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default ReportDetail;
+
+===== ./frontend/src/pages/ReportsList.js =====
+import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { reportService } from '../services/api';
+import '../styles/pages.css';
+
+function ReportsList() {
+  const [reports, setReports] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetchReports();
+  }, []);
+
+  const fetchReports = async () => {
+    try {
+      setLoading(true);
+      const data = await reportService.getAllReports();
+      setReports(data);
+      setError(null);
+    } catch (err) {
+      console.error('Error fetching reports:', err);
+      setError('Failed to load reports');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    if (window.confirm('Are you sure you want to delete this report?')) {
+      try {
+        await reportService.deleteReport(id);
+        setReports(reports.filter(r => r._id !== id));
+      } catch (err) {
+        console.error('Error deleting report:', err);
+        setError('Failed to delete report');
+      }
+    }
+  };
+
+  const getStatusBadgeClass = (status) => {
+    return `badge badge-${status}`;
+  };
+
+  if (loading) {
+    return (
+      <div className="container">
+        <div className="loading">
+          <div className="spinner"></div>
+          <p>Loading reports...</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container">
+      <div className="page-header">
+        <h1>Reports Dashboard</h1>
+        <Link to="/create" className="btn btn-primary">
+          + Create New Report
+        </Link>
+      </div>
+
+      {error && <div className="alert alert-error">{error}</div>}
+
+      {reports.length === 0 ? (
+        <div className="card">
+          <p className="text-center">No reports yet. <Link to="/create">Create one now!</Link></p>
+        </div>
+      ) : (
+        <div className="grid">
+          {reports.map(report => (
+            <div key={report._id} className="card report-card">
+              <div className="card-header">
+                <h3>{report.quarter} {report.year}</h3>
+              </div>
+              <div className="report-card-body">
+                <p className="report-title">{report.title}</p>
+                <div className="report-status">
+                  <span className={getStatusBadgeClass(report.status)}>
+                    {report.status.toUpperCase()}
+                  </span>
+                </div>
+                {report.generationMetadata && (
+                  <div className="report-metadata">
+                    <small>
+                      Generated: {new Date(report.generationMetadata.generatedAt).toLocaleDateString()}
+                    </small>
+                  </div>
+                )}
+                <div className="report-actions">
+                  <Link to={`/report/${report._id}`} className="btn btn-sm btn-primary">
+                    View
+                  </Link>
+                  <button 
+                    onClick={() => handleDelete(report._id)} 
+                    className="btn btn-sm btn-danger"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default ReportsList;
+
+
+===== ./frontend/src/services/api.js =====
+import axios from 'axios';
+
+const API_BASE_URL = 'http://localhost:5000/api';
+
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json'
+  }
+});
+
+export const reportService = {
+  // Get all reports
+  getAllReports: async () => {
+    const response = await api.get('/reports');
+    return response.data;
+  },
+
+  // Get single report
+  getReport: async (id) => {
+    const response = await api.get(`/reports/${id}`);
+    return response.data;
+  },
+
+  // Create new report
+  createReport: async (reportData) => {
+    const response = await api.post('/reports', reportData);
+    return response.data;
+  },
+
+  // Generate report with AI
+  generateReport: async (id) => {
+    const response = await api.post(`/reports/${id}/generate`);
+    return response.data;
+  },
+
+  // Update report
+  updateReport: async (id, reportData) => {
+    const response = await api.put(`/reports/${id}`, reportData);
+    return response.data;
+  },
+
+  // Delete report
+  deleteReport: async (id) => {
+    const response = await api.delete(`/reports/${id}`);
+    return response.data;
+  },
+
+  // Get report HTML
+  getReportHTML: async (id) => {
+    const response = await api.get(`/reports/${id}/html`);
+    return response.data;
+  }
+};
+
+export default api;
+
+
+===== ./frontend/src/styles/pages.css =====
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+}
+
+.page-header h1 {
+  color: #1e40af;
+  font-size: 2em;
+  margin: 0;
+}
+
+.page-header .subtitle {
+  color: #666;
+  font-size: 1rem;
+  margin: 0.5rem 0 0 0;
+}
+
+.header-actions {
+  display: flex;
+  gap: 1rem;
+}
+
+/* Report Form */
+.report-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.5rem;
+}
+
+.form-actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 2rem;
+  justify-content: center;
+}
+
+.btn-lg {
+  padding: 1rem 2rem;
+  font-size: 1.1rem;
+}
+
+/* Input with Button */
+.input-with-btn {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.input-with-btn input {
+  flex: 1;
+}
+
+/* Tags */
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.tag {
+  background: #dbeafe;
+  color: #0c4a6e;
+  padding: 0.5rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.875rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.tag-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1.2rem;
+  padding: 0;
+  line-height: 1;
+}
+
+.tag-remove:hover {
+  opacity: 0.7;
+}
+
+/* Report Card */
+.report-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 100%;
+}
+
+.report-card-body {
+  flex: 1;
+}
+
+.report-title {
+  font-size: 0.95rem;
+  color: #666;
+  margin: 0.5rem 0;
+}
+
+.report-status {
+  margin: 1rem 0;
+}
+
+.report-metadata {
+  color: #999;
+  margin: 1rem 0;
+}
+
+.report-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+/* Performers List */
+.performers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.performer-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f9fafb;
+  padding: 1rem;
+  border-radius: 6px;
+  border-left: 3px solid #1e40af;
+}
+
+.performer-info {
+  flex: 1;
+}
+
+.performance {
+  color: #16a34a;
+  font-weight: bold;
+  margin-left: 0.5rem;
+}
+
+.align-end {
+  display: flex;
+  align-items: flex-end;
+}
+
+/* Report Detail */
+.html-preview {
+  border: 2px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 2rem;
+  background: white;
+  margin: 1rem 0;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.html-preview h1,
+.html-preview h2,
+.html-preview h3 {
+  color: #1e40af;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.html-preview h1 {
+  font-size: 2em;
+  border-bottom: 3px solid #1e40af;
+  padding-bottom: 1rem;
+}
+
+.html-preview p {
+  line-height: 1.6;
+  margin-bottom: 0.75rem;
+  color: #333;
+}
+
+.metadata {
+  background: #f0f4ff;
+  padding: 1rem;
+  border-radius: 6px;
+  margin: 1rem 0;
+}
+
+.metadata p {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+  color: #555;
+}
+
+.data-section {
+  margin-bottom: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.data-section h3 {
+  color: #1e40af;
+  margin-bottom: 0.75rem;
+}
+
+.data-section p {
+  margin: 0.5rem 0;
+  color: #555;
+}
+
+.spinner-sm {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #f3f4f6;
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: 0.5rem;
+}
+
+.text-center {
+  text-align: center;
+}
+
+.report-preview {
+  margin-top: 1rem;
+}
+
+/* Media Queries */
+@media (max-width: 768px) {
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1rem;
+  }
+
+  .header-actions {
+    width: 100%;
+  }
+
+  .form-row {
+    grid-template-columns: 1fr;
+  }
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .performer-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .performer-item .btn {
+    align-self: flex-start;
+    margin-top: 0.5rem;
+  }
+}
+

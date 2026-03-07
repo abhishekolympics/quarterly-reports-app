@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { Link } from 'react-router-dom';
 import './AnnualReports.css';
 
 const AnnualReports = () => {
@@ -29,16 +30,13 @@ const AnnualReports = () => {
     setSuccess('');
 
     try {
-      // Create annual report
       const createResponse = await axios.post('/api/annual-reports', { year: selectedYear });
       const reportId = createResponse.data._id;
 
-      // Generate report
       const generateResponse = await axios.post(`/api/annual-reports/${reportId}/generate`);
 
       if (generateResponse.data) {
         setSuccess(`Annual report for ${selectedYear} generated successfully!`);
-        // Refresh list
         fetchReports();
       }
     } catch (err) {
@@ -50,13 +48,9 @@ const AnnualReports = () => {
     }
   };
 
-  // FIXED: Use fetch to bypass React Router
   const handleViewHTML = async (id) => {
     try {
       setError('');
-      console.log(`[AnnualReports] Fetching HTML for report ${id}`);
-      
-      // Fetch HTML as text
       const response = await fetch(`/api/annual-reports/${id}/html`);
       
       if (!response.ok) {
@@ -64,13 +58,11 @@ const AnnualReports = () => {
       }
       
       const htmlContent = await response.text();
-      console.log(`[AnnualReports] Received HTML: ${htmlContent.length} bytes`);
       
       if (!htmlContent || htmlContent.length === 0) {
         throw new Error('HTML content is empty');
       }
       
-      // Create a new window and write HTML
       const newWindow = window.open('', '_blank');
       if (!newWindow) {
         throw new Error('Could not open new window. Pop-ups may be blocked.');
@@ -78,20 +70,15 @@ const AnnualReports = () => {
       
       newWindow.document.write(htmlContent);
       newWindow.document.close();
-      console.log('[AnnualReports] HTML opened in new window');
     } catch (err) {
       console.error('Error viewing HTML:', err);
       setError(`Failed to load HTML report: ${err.message}`);
     }
   };
 
-  // FIXED: Use fetch to bypass React Router
   const handleDownloadPDF = async (id) => {
     try {
       setError('');
-      console.log(`[AnnualReports] Downloading PDF for report ${id}`);
-      
-      // Fetch PDF as blob
       const response = await fetch(`/api/annual-reports/${id}/pdf`);
       
       if (!response.ok) {
@@ -99,13 +86,11 @@ const AnnualReports = () => {
       }
       
       const blob = await response.blob();
-      console.log(`[AnnualReports] Received PDF: ${blob.size} bytes`);
       
       if (blob.size === 0) {
         throw new Error('PDF is empty');
       }
       
-      // Create download link
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -113,13 +98,10 @@ const AnnualReports = () => {
       document.body.appendChild(link);
       link.click();
       
-      // Cleanup
       setTimeout(() => {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(url);
       }, 100);
-      
-      console.log('[AnnualReports] PDF download started');
     } catch (err) {
       console.error('Error downloading PDF:', err);
       setError(`Failed to download PDF: ${err.message}`);
@@ -190,6 +172,12 @@ const AnnualReports = () => {
                     >
                       Download PDF
                     </button>
+                    <Link 
+                      to={`/annual-reports/${report._id}/analytics`} 
+                      className="btn-analytics"
+                    >
+                      View Analytics
+                    </Link>
                   </div>
                 )}
 
