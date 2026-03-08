@@ -1,16 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 
 const ExecutiveSummary = ({ analysis }) => {
   const [summary, setSummary] = useState('');
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    if (analysis) {
-      generateSummary();
-    }
-  }, [analysis]);
-
-  const generateSummary = async () => {
+  const generateSummary = useCallback(async () => {
     try {
       setLoading(true);
 
@@ -44,7 +38,8 @@ const ExecutiveSummary = ({ analysis }) => {
         Write it as a professional financial analyst would. Focus on the overall market trend and key takeaway. Keep it 2 sentences maximum. Do NOT include the word "summary".`;
       }
 
-      const response = await fetch('/api/gemini/generate', {
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/gemini/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt })
@@ -62,7 +57,13 @@ const ExecutiveSummary = ({ analysis }) => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [analysis]);
+
+  useEffect(() => {
+    if (analysis) {
+      generateSummary();
+    }
+  }, [analysis, generateSummary]);
 
   return (
     <div className="executive-summary">
