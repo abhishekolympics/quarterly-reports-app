@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { reportService } from '../services/api';
-import axios from 'axios';
 import '../styles/pages.css';
 
 function ReportsList() {
@@ -18,24 +17,13 @@ function ReportsList() {
     try {
       setLoading(true);
       
-      // 1. Fetch data from your service
-      const data = await reportService.getAllReports();
+      // Fetch quarterly reports
+      const quarterlyData = await reportService.getAllReports();
+      setQuarterlyReports(Array.isArray(quarterlyData) ? quarterlyData : []);
 
-      // 2. Check the "shape" of the data before setting state
-      // If the backend returns { quarterly: [...], annual: [...] }
-      if (data && data.quarterly) {
-        setQuarterlyReports(data.quarterly);
-      } else if (Array.isArray(data)) {
-        // Fallback if it's already an array
-        setQuarterlyReports(data);
-      }
-
-      // 3. Fetch annual reports using the full URL to be safe
-      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com';
-      const annualResponse = await axios.get(`${API_URL}/annual-reports`);
-      
-      // Ensure we only set state if the response is an array
-      setAnnualReports(Array.isArray(annualResponse.data) ? annualResponse.data : []);
+      // Fetch annual reports
+      const annualData = await reportService.getAllAnnualReports();
+      setAnnualReports(Array.isArray(annualData) ? annualData : []);
       
       setError(null);
     } catch (err) {
@@ -61,12 +49,63 @@ function ReportsList() {
   const handleDeleteAnnual = async (id) => {
     if (window.confirm('Are you sure you want to delete this annual report?')) {
       try {
-        await axios.delete(`/api/annual-reports/${id}`);
+        await reportService.deleteAnnualReport(id);
         setAnnualReports(annualReports.filter(r => r._id !== id));
       } catch (err) {
         console.error('Error deleting annual report:', err);
         setError('Failed to delete annual report');
       }
+    }
+  };
+
+  const handleDownloadAnnualPDF = async (id, year) => {
+    try {
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/annual-reports/${id}/pdf`);
+      
+      if (!response.ok) {
+        throw new Error('Failed to download PDF');
+      }
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `annual-report-${year}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(url);
+      }, 100);
+    } catch (err) {
+      console.error('Error downloading PDF:', err);
+      alert('Failed to download PDF');
+    }
+  };
+
+  const handleViewAnnualHTML = async (id) => {
+    try {
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/annual-reports/${id}/html`);
+      
+      if (!response.ok) {
+        throw new Error('Failed to fetch HTML');
+      }
+      
+      const htmlContent = await response.text();
+      
+      const newWindow = window.open('', '_blank');
+      if (!newWindow) {
+        throw new Error('Could not open new window. Pop-ups may be blocked.');
+      }
+      
+      newWindow.document.write(htmlContent);
+      newWindow.document.close();
+    } catch (err) {
+      console.error('Error viewing HTML:', err);
+      alert('Failed to load report');
     }
   };
 
@@ -127,15 +166,31 @@ function ReportsList() {
                     </div>
                   )}
                   <div className="report-actions">
-                    <Link to={`/annual-reports/${report._id}/analytics`} className="btn btn-sm btn-primary">
-                      View
+                    <button 
+                      onClick={() => handleViewAnnualHTML(report._id)}
+                      className="btn btn-sm btn-primary"
+                      title="View full report"
+                    >
+                      View Report
+                    </button>
+                    <Link 
+                      to={`/annual-reports/${report._id}/analytics`} 
+                      className="btn btn-sm btn-secondary"
+                      title="View analytics dashboard"
+                    >
+                      Analytics
                     </Link>
-                    <a href={`/api/annual-reports/${report._id}/pdf`} className="btn btn-sm btn-secondary">
+                    <button 
+                      onClick={() => handleDownloadAnnualPDF(report._id, report.year)}
+                      className="btn btn-sm btn-secondary"
+                      title="Download PDF"
+                    >
                       Download
-                    </a>
+                    </button>
                     <button 
                       onClick={() => handleDeleteAnnual(report._id)} 
                       className="btn btn-sm btn-danger"
+                      title="Delete report"
                     >
                       Delete
                     </button>
@@ -182,15 +237,32 @@ function ReportsList() {
                     </div>
                   )}
                   <div className="report-actions">
-                    <Link to={`/report/${report._id}`} className="btn btn-sm btn-primary">
-                      View
+                    <Link 
+                      to={`/report/${report._id}`} 
+                      className="btn btn-sm btn-primary"
+                      title="View full report"
+                    >
+                      View Report
                     </Link>
-                    <Link to={`/report/${report._id}/analytics`} className="btn btn-sm btn-secondary">
+                    <Link 
+                      to={`/report/${report._id}/analytics`} 
+                      className="btn btn-sm btn-secondary"
+                      title="View analytics dashboard"
+                    >
                       Analytics
                     </Link>
+                    <a 
+                      href={`${process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api'}/reports/${report._id}/pdf`}
+                      className="btn btn-sm btn-secondary"
+                      title="Download PDF"
+                      download
+                    >
+                      Download
+                    </a>
                     <button 
                       onClick={() => handleDeleteQuarterly(report._id)} 
                       className="btn btn-sm btn-danger"
+                      title="Delete report"
                     >
                       Delete
                     </button>
