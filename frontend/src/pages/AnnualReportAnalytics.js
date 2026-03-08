@@ -1,6 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
-import axios from 'axios';
 import AnalyticsDisplay from '../components/AnalyticsDisplay';
 import ChartsDisplay from '../components/ChartsDisplay';
 import MarketDriversDisplay from '../components/MarketDriversDisplay';
@@ -8,6 +7,7 @@ import ExecutiveSummary from '../components/ExecutiveSummary';
 import DataSourcesCard from '../components/DataSourcesCard';
 import ResearchCopilot from '../components/ResearchCopilot';
 import { analyzeAnnualReport } from '../components/MarketAnalytics';
+import reportService from '../services/api';
 import '../styles/analyticsPage.css';
 
 const AnnualReportAnalytics = () => {
@@ -22,10 +22,10 @@ const AnnualReportAnalytics = () => {
     const fetchReport = async () => {
       try {
         setLoading(true);
-        const response = await axios.get(`/api/annual-reports/${id}`);
-        setReport(response.data);
+        const data = await reportService.getAnnualReport(id);
+        setReport(data);
         
-        const analyzedData = analyzeAnnualReport(response.data);
+        const analyzedData = analyzeAnnualReport(data);
         setAnalysis(analyzedData);
       } catch (err) {
         setError('Failed to load report');

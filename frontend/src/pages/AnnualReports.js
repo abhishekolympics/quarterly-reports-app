@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
 import { Link } from 'react-router-dom';
+import { reportService } from '../services/api';
 import './AnnualReports.css';
 
 const AnnualReports = () => {
@@ -16,8 +16,8 @@ const AnnualReports = () => {
 
   const fetchReports = async () => {
     try {
-      const response = await axios.get('/api/annual-reports');
-      setReports(response.data);
+      const data = await reportService.getAllAnnualReports();
+      setReports(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error('Error fetching reports:', err);
       setError('Failed to fetch reports');
@@ -30,12 +30,12 @@ const AnnualReports = () => {
     setSuccess('');
 
     try {
-      const createResponse = await axios.post('/api/annual-reports', { year: selectedYear });
-      const reportId = createResponse.data._id;
+      const createResponse = await reportService.createAnnualReport({ year: selectedYear });
+      const reportId = createResponse._id;
 
-      const generateResponse = await axios.post(`/api/annual-reports/${reportId}/generate`);
+      const generateResponse = await reportService.generateAnnualReport(reportId);
 
-      if (generateResponse.data) {
+      if (generateResponse) {
         setSuccess(`Annual report for ${selectedYear} generated successfully!`);
         fetchReports();
       }
@@ -51,7 +51,8 @@ const AnnualReports = () => {
   const handleViewHTML = async (id) => {
     try {
       setError('');
-      const response = await fetch(`/api/annual-reports/${id}/html`);
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/annual-reports/${id}/html`);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: Failed to fetch HTML`);
@@ -79,7 +80,8 @@ const AnnualReports = () => {
   const handleDownloadPDF = async (id) => {
     try {
       setError('');
-      const response = await fetch(`/api/annual-reports/${id}/pdf`);
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/annual-reports/${id}/pdf`);
       
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: Failed to fetch PDF`);
@@ -94,7 +96,7 @@ const AnnualReports = () => {
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `annual-report-${new Date().getFullYear()}.pdf`;
+      link.download = `annual-report-${selectedYear}.pdf`;
       document.body.appendChild(link);
       link.click();
       
@@ -105,6 +107,19 @@ const AnnualReports = () => {
     } catch (err) {
       console.error('Error downloading PDF:', err);
       setError(`Failed to download PDF: ${err.message}`);
+    }
+  };
+
+  const handleDeleteReport = async (id) => {
+    if (window.confirm('Are you sure you want to delete this annual report?')) {
+      try {
+        await reportService.deleteAnnualReport(id);
+        setSuccess('Report deleted successfully');
+        fetchReports();
+      } catch (err) {
+        console.error('Error deleting report:', err);
+        setError('Failed to delete report');
+      }
     }
   };
 
@@ -180,6 +195,22 @@ const AnnualReports = () => {
                     </Link>
                   </div>
                 )}
+
+                <button
+                  onClick={() => handleDeleteReport(report._id)}
+                  className="btn-delete"
+                  style={{
+                    background: '#dc2626',
+                    color: 'white',
+                    padding: '8px 16px',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    marginTop: '10px'
+                  }}
+                >
+                  Delete
+                </button>
 
                 <p className="timestamp">
                   Generated: {new Date(report.createdAt).toLocaleDateString()}
