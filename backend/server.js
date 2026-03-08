@@ -8,21 +8,15 @@ const geminiRoutes = require('./routes/gemini');
 
 const app = express();
 
-// CORS Configuration
-const corsOptions = {
-  origin: [
-    'http://localhost:3000',
-    'http://localhost:5000',
-    'https://quarterly-reports-app-frontend.onrender.com',
-    'https://quarterly-reports-app.onrender.com'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+// CORS Configuration - Allow all origins
+app.use(cors({
+  origin: '*',
+  credentials: false,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization']
-};
+}));
 
 // Middleware
-app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
