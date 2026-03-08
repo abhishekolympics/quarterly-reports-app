@@ -18,13 +18,24 @@ function ReportsList() {
     try {
       setLoading(true);
       
-      // Fetch quarterly reports
-      const quarterlyData = await reportService.getAllReports();
-      setQuarterlyReports(quarterlyData);
+      // 1. Fetch data from your service
+      const data = await reportService.getAllReports();
 
-      // Fetch annual reports
-      const annualData = await axios.get('/api/annual-reports');
-      setAnnualReports(annualData.data);
+      // 2. Check the "shape" of the data before setting state
+      // If the backend returns { quarterly: [...], annual: [...] }
+      if (data && data.quarterly) {
+        setQuarterlyReports(data.quarterly);
+      } else if (Array.isArray(data)) {
+        // Fallback if it's already an array
+        setQuarterlyReports(data);
+      }
+
+      // 3. Fetch annual reports using the full URL to be safe
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com';
+      const annualResponse = await axios.get(`${API_URL}/annual-reports`);
+      
+      // Ensure we only set state if the response is an array
+      setAnnualReports(Array.isArray(annualResponse.data) ? annualResponse.data : []);
       
       setError(null);
     } catch (err) {
