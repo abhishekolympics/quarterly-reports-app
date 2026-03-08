@@ -86,7 +86,8 @@ const ResearchCopilot = ({ analysis, report }) => {
                 `;
       }
 
-      const response = await fetch('/api/gemini/generate', {
+      const API_URL = process.env.REACT_APP_API_BASE_URL || 'https://quarterly-reports-app.onrender.com/api';
+      const response = await fetch(`${API_URL}/gemini/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: context })
