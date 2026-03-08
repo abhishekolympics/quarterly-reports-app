@@ -269,4 +269,24 @@ router.get('/annual-reports/:id/pdf', async (req, res) => {
   }
 });
 
+// DELETE annual report
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    console.log('[AnnualReports DELETE] Deleting report:', id);
+    
+    const result = await AnnualReport.findByIdAndDelete(id);
+    
+    if (!result) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    
+    res.json({ message: 'Report deleted successfully', deletedId: id });
+  } catch (error) {
+    console.error('[AnnualReports DELETE] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router;

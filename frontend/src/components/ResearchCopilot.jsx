@@ -25,31 +25,66 @@ const ResearchCopilot = ({ analysis, report }) => {
     try {
       setLoading(true);
 
-      // Build context from analysis
-      const context = `
-You are a financial research analyst. Answer the user's question about this 2025 equity market report:
+      // Check if it's quarterly or annual report
+      const isQuarterly = analysis.quarter && !analysis.metrics?.yearTotal;
+      
+      let context = '';
 
-**Key Metrics:**
-- S&P 500 Annual Return: ${analysis.metrics.yearTotal.sp500}%
-- Nasdaq Annual Return: ${analysis.metrics.yearTotal.nasdaq}%
-- MSCI ACWI Return: ${analysis.metrics.yearTotal.acwi}%
-- Nasdaq Outperformance: ${analysis.metrics.nasdaqVsSP500}%
-- Best Quarter: ${analysis.metrics.bestQuarter.quarter} (S&P: ${analysis.metrics.bestQuarter.sp500}%, Nasdaq: ${analysis.metrics.bestQuarter.nasdaq}%)
-- Worst Quarter: ${analysis.metrics.worstQuarter.quarter} (S&P: ${analysis.metrics.worstQuarter.sp500}%, Nasdaq: ${analysis.metrics.worstQuarter.nasdaq}%)
+      if (isQuarterly) {
+        // Quarterly report context
+        context = `
+          You are a financial research analyst. Answer the user's question about this quarterly market report:
 
-**Quarterly Performance:**
-${analysis.quarters.map(q => `${q.quarter}: S&P ${q.sp500}%, Nasdaq ${q.nasdaq}%, MSCI ACWI ${q.acwi}%`).join('\n')}
+          **Quarter:** ${analysis.quarter} ${analysis.year}
 
-**Market Drivers:**
-- Overall Concentration Risk: ${analysis.drivers.overallConcentrationRisk}
-- Top Performers: ${analysis.drivers.topMoversAcrossYear.map(m => `${m.fullName} (+${m.return}%)`).join(', ') || 'Market indices'}
-- Leading Sectors: ${analysis.drivers.topSectors.leaders.join(', ') || 'Technology-led'}
-- Lagging Sectors: ${analysis.drivers.topSectors.laggards.join(', ') || 'Energy'}
+          **Key Metrics:**
+          - S&P 500 Return: ${analysis.metrics.sp500}%
+          - Nasdaq Return: ${analysis.metrics.nasdaq}%
+          - MSCI ACWI Return: ${analysis.metrics.acwi}%
+          - Performance Spread: ${analysis.metrics.spread.toFixed(2)}%
+          - Record Highs: S&P 500 reached ${analysis.metrics.recordHighs} new highs
 
-User Question: "${question}"
+          **Narrative:**
+          ${analysis.narrative}
 
-Provide a concise, insightful answer (2-3 sentences) based on the data above. Be specific with numbers and trends.
-      `;
+          **Summary:**
+          ${analysis.summary}
+
+          **Major News Events:**
+          ${analysis.majorNews && analysis.majorNews.length > 0 ? analysis.majorNews.join(', ') : 'No major news recorded'}
+
+          User Question: "${question}"
+
+          Provide a concise, insightful answer (2-3 sentences) based on the quarterly data above.
+                `;
+              } else {
+                // Annual report context
+                context = `
+          You are a financial research analyst. Answer the user's question about this annual market report:
+
+          **Year:** ${analysis.metrics.yearTotal ? '2025' : 'Current Year'}
+
+          **Annual Metrics:**
+          - S&P 500 Annual Return: ${analysis.metrics.yearTotal?.sp500 || 0}%
+          - Nasdaq Annual Return: ${analysis.metrics.yearTotal?.nasdaq || 0}%
+          - MSCI ACWI Return: ${analysis.metrics.yearTotal?.acwi || 0}%
+          - Nasdaq Outperformance: ${analysis.metrics.nasdaqVsSP500}%
+          - Best Quarter: ${analysis.metrics.bestQuarter?.quarter} (${analysis.metrics.bestQuarter?.sp500}%)
+          - Worst Quarter: ${analysis.metrics.worstQuarter?.quarter} (${analysis.metrics.worstQuarter?.sp500}%)
+
+          **Quarterly Breakdown:**
+          ${analysis.quarters?.map(q => `${q.quarter}: S&P ${q.sp500}%, Nasdaq ${q.nasdaq}%, MSCI ACWI ${q.acwi}%`).join('\n') || 'No quarterly data'}
+
+          **Market Drivers:**
+          - Overall Concentration Risk: ${analysis.drivers.overallConcentrationRisk}
+          - Top Performers: ${analysis.drivers.topMoversAcrossYear.map(m => `${m.fullName} (+${m.return}%)`).join(', ') || 'Market indices'}
+          - Leading Sectors: ${analysis.drivers.topSectors.leaders.join(', ') || 'Technology-led'}
+
+          User Question: "${question}"
+
+          Provide a concise, insightful answer (2-3 sentences) based on the annual data above.
+                `;
+      }
 
       const response = await fetch('/api/gemini/generate', {
         method: 'POST',
