@@ -10,10 +10,9 @@ const app = express();
 
 // CORS Configuration - Allow all origins
 app.use(cors({
-  origin: '*',
-  credentials: false,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: '*', // Allow all origins
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'], // Allow all methods
+  allowedHeaders: '*' // Allow all headers
 }));
 
 // Middleware
