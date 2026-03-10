@@ -33,7 +33,6 @@ router.post('/annual-reports', async (req, res) => {
   }
 });
 
-// Generate annual report
 router.post('/annual-reports/:id/generate', async (req, res) => {
   try {
     const report = await AnnualReport.findById(req.params.id);
@@ -270,7 +269,7 @@ router.get('/annual-reports/:id/pdf', async (req, res) => {
 });
 
 // DELETE annual report
-router.delete('/:id', async (req, res) => {
+router.delete('/annual-reports/:id', async (req, res) => {
   try {
     const { id } = req.params;
     
